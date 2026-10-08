@@ -47,27 +47,67 @@ type Json = Prisma.InputJsonObject;
  * `null` rather than a guess, so downstream code can tell "unknown" from
  * "parsed successfully".
  */
-export function parseRoute(route: string | null | undefined): { from: string; to: string } | null {
+export function parseRoute(route: string | null | undefined): {
+  from: string;
+  to: string;
+  /** Intermediate airports for a connecting route; empty for a direct one. */
+  via: string[];
+} | null {
   if (!route) return null;
   const parts = route
     .split(/\s*(?:→|->|➜)\s*/)
     .map((p) => p.trim())
     .filter(Boolean);
-  if (parts.length !== 2) return null;
-  return { from: parts[0], to: parts[1] };
+  if (parts.length < 2) return null;
+  return { from: parts[0], to: parts[parts.length - 1], via: parts.slice(1, -1) };
 }
 
 /**
- * IATA carrier code from a carrier name.
+ * IATA two-letter code per carrier name.
  *
- * Only recognises a name that *is* a 2-letter code. "British Airways" → "BA"
- * is a lookup against a carrier table, not a transform, and guessing it would
- * produce confidently wrong PNRs — so it stays null here.
+ * These are looked up, not derived. "British Airways" → "BA" is a fact about
+ * that carrier, and the first draft of this file tried to avoid the lookup by
+ * refusing to map anything, which left `SearchDocument.carrierCode` null for
+ * every row and the `@@index([type, carrierCode])` behind it serving nothing.
+ * Guessing would have been worse — a wrong code produces a confidently wrong
+ * PNR — so the mapping is spelled out and reviewable instead.
+ *
+ * Covers every name in `FLIGHT_CARRIERS` (seed-global.ts).
+ */
+const CARRIER_CODES: Record<string, string> = {
+  'Air Canada': 'AC',
+  'Air Europa': 'UX',
+  'Air France': 'AF',
+  'ANA': 'NH',
+  'Austrian Airlines': 'OS',
+  'British Airways': 'BA',
+  'Cathay Pacific': 'CX',
+  'Delta Air Lines': 'DL',
+  'Emirates': 'EK',
+  'Iberia': 'IB',
+  'ITA Airways': 'AZ',
+  'Japan Airlines': 'JL',
+  'JetBlue': 'B6',
+  'KLM': 'KL',
+  'Lufthansa': 'LH',
+  'Qantas': 'QF',
+  'Singapore Airlines': 'SQ',
+  'SWISS': 'LX',
+  'TAP Air Portugal': 'TP',
+  'Turkish Airlines': 'TK',
+  'United Airlines': 'UA',
+  'Virgin Atlantic': 'VS',
+};
+
+/**
+ * IATA carrier code for a carrier name, or null when the name is not one this
+ * table knows. A literal two-letter code passes through unchanged.
  */
 function carrierCodeFromName(name: string | null | undefined): string | null {
   if (!name) return null;
   const explicit = /^\s*([A-Z0-9]{2})\s*$/.exec(name);
-  return explicit ? explicit[1] : null;
+  if (explicit) return explicit[1];
+  return CARRIER_CODES[name] ?? null;
 }
 
 /** Stable uppercase code from free text: "Deluxe King" → "DELUXE_KING". */
@@ -108,30 +148,200 @@ function roomTypesFor(product: Product): Json[] {
  * Ordered segments for a flight.
  *
  * A flat "SIN → JFK" route describes one hop, so this yields a single segment.
- * Multi-city itineraries need a real `FlightSegment` table; until one exists
- * this is correct for the direct case and lossy for the rest — `segmentCount`
- * reports what we emit, not the true itinerary length.
+ * A route written with a connection point ("SIN → DXB → JFK") yields the two
+ * legs it actually names, with the layover spelled out — this is what makes
+ * connection search answerable instead of always empty.
+ *
+ * Times come from {@link CONNECTING_ITINERARIES} when it names the route, and
+ * from {@link synthesisedSchedule} when it does not. They are never omitted for
+ * a connecting itinerary — see the note on that function for why a null layover
+ * is worse than a demo one.
  */
 function segmentsFor(product: Product): Json[] {
   const route = parseRoute(product.flightRoute);
   if (!route) return [];
 
-  return [
-    {
-      seq: 1,
+  const scheduled =
+    CONNECTING_ITINERARIES[[route.from, ...route.via, route.to].join('|')] ??
+    (route.via.length > 0 ? synthesisedSchedule(route) : null);
+  /**
+   * One entry per *leg*, not per airport. `SIN → DXB → JFK` is two flights, so
+   * `legs` is `[DXB, JFK]`: leg 1 departs `from` and arrives at `legs[0]`, leg
+   * 2 departs `legs[0]` and arrives at `legs[1]`. Building the list from the
+   * airports instead (`[from, ...legs]`) emitted a third, imaginary segment —
+   * `SIN → DXB`, `DXB → JFK`, `JFK → nowhere` — which is why a two-leg
+   * itinerary reported `segmentCount: 3`.
+   */
+  const legs = route.via.length > 0 ? [...route.via, route.to] : [route.to];
+
+  return legs.map((arrivalAirport, index) => {
+    const departureAirport = index === 0 ? route.from : legs[index - 1];
+    const departureAt = scheduled?.legs[index]?.departureAt ?? null;
+    const arrivalAt = scheduled?.legs[index]?.arrivalAt ?? null;
+    return {
+      seq: index + 1,
       marketingCarrier: product.airlineName ?? 'UNKNOWN',
       operatingCarrier: product.airlineName,
-      flightNumber: null, // not carried by the flat columns
-      aircraft: null,
-      departure: { airport: route.from, scheduledAt: null, offset: null },
-      arrival: { airport: route.to, scheduledAt: null, offset: null },
-      durationMinutes: null,
+      flightNumber: scheduled?.legs[index]?.flightNumber ?? null,
+      aircraft: scheduled?.legs[index]?.aircraft ?? null,
+      departure: { airport: departureAirport, scheduledAt: departureAt, offset: null },
+      arrival: { airport: arrivalAirport, scheduledAt: arrivalAt, offset: null },
+      durationMinutes:
+        departureAt && arrivalAt
+          ? Math.round((new Date(arrivalAt).getTime() - new Date(departureAt).getTime()) / 60_000)
+          : null,
       cabinCode: product.cabinClass,
       bookingClass: null,
       fareFamily: null,
-    },
-  ];
+    };
+  });
 }
+
+/**
+ * A deterministic demo schedule for a connecting route the table does not name.
+ *
+ * `CONNECTING_ITINERARIES` is keyed by the exact route string, so it can only
+ * ever schedule the itineraries someone remembered to add. Generating routes
+ * against a hand-kept table drifts: the catalogue grew past the table, three
+ * connecting products (`HKG→DXB→LAX`, `SIN→DXB→LAX`, `LAX→DXB→JFK`) were seeded
+ * with **null** leg times, and because `withinLayoverBounds` deliberately passes
+ * an itinerary whose gap cannot be computed, those three survived a filter that
+ * asked for a one-minute maximum layover. A shopper asking for a tight
+ * connection was shown an itinerary of unknown length.
+ *
+ * So every connecting itinerary gets times. This is demo inventory in exactly
+ * the sense the table already documents — the operator name, route and fare are
+ * all illustrative — and a coherent schedule is what makes the layover filters
+ * answerable. The alternative on record was to leave the times null and let the
+ * filter abstain, which is the behaviour that produced the bug.
+ *
+ * Deterministic on the route string, so re-seeding produces byte-identical rows
+ * and the data does not reshuffle between runs (`hash()` in `seed-global.ts`
+ * exists for the same reason). The layover is the same 3h25m the hand-written
+ * table uses, so the two sources are indistinguishable to a consumer.
+ */
+function synthesisedSchedule(route: { from: string; to: string; via: string[] }): {
+  legs: { departureAt: string; arrivalAt: string; flightNumber: string; aircraft: string }[];
+} {
+  /** 2026-11-05T00:00Z, matching the hand-written table's base date. */
+  const BASE = Date.UTC(2026, 10, 5);
+  const MINUTE = 60_000;
+
+  /** FNV-1a, mirroring `seed-global.ts` — stable across Node versions. */
+  const hash = (value: string): number => {
+    let h = 2166136261;
+    for (let i = 0; i < value.length; i += 1) {
+      h ^= value.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  };
+
+  const airports = [route.from, ...route.via, route.to];
+  let cursor = BASE + (hash(airports.join('|')) % 720) * MINUTE;
+
+  const legs = airports.slice(0, -1).map((from, index) => {
+    const to = airports[index + 1];
+    // A plausible block time in the 5h–13h band, fixed per leg so the same
+    // route always yields the same schedule.
+    const blockMinutes = 300 + (hash(`${from}-${to}`) % 481);
+    const departureAt = cursor;
+    const arrivalAt = departureAt + blockMinutes * MINUTE;
+
+    // 3h25m on the ground at the intermediate stop: long enough to clear
+    // transit formalities, and identical to the hand-written table's buffer.
+    cursor = arrivalAt + 205 * MINUTE;
+
+    return {
+      departureAt: new Date(departureAt).toISOString(),
+      arrivalAt: new Date(arrivalAt).toISOString(),
+      // The seed carrier numbering pattern, not a real flight number.
+      flightNumber: `EK${100 + (hash(`${to}-${index}`) % 800)}`,
+      aircraft: 'B77W',
+    };
+  });
+
+  return { legs };
+}
+
+/**
+ * Connecting itineraries with real leg times.
+ *
+ * Every seeded flight product used to be a direct hop, so without this table the
+ * connection endpoints had nothing to match: 34 products, 34 segments, zero
+ * intermediate stops, and `/search/connections` answered `[]` for every airport
+ * including the obvious ones.
+ *
+ * Keyed by the full `ORIGIN→VIA→DEST` route rather than by leg, so a leg can
+ * only be scheduled as part of an itinerary that actually exists. Times are
+ * laid out with a 3h25m layover at the hub — long enough to clear transit
+ * formalities — and the search filters (`minLayoverMinutes`,
+ * `maxLayoverMinutes`) have something real to sort against.
+ *
+ * These are scheduled-service-shaped times for demo inventory, not a live
+ * schedule. They are illustrative only: a customer-facing PNR must come from a
+ * supplier feed.
+ */
+const CONNECTING_ITINERARIES: Record<
+  string,
+  { legs: { departureAt: string; arrivalAt: string; flightNumber: string; aircraft: string }[] }
+> = {
+  'SIN|DXB|JFK': {
+    legs: [
+      { departureAt: '2026-11-05T09:15:00Z', arrivalAt: '2026-11-05T14:40:00Z', flightNumber: 'EK001', aircraft: 'B77W' },
+      { departureAt: '2026-11-05T18:05:00Z', arrivalAt: '2026-11-06T00:25:00Z', flightNumber: 'EK030', aircraft: 'B77W' },
+    ],
+  },
+  'SIN|DXB|SIN': {
+    legs: [
+      { departureAt: '2026-11-05T09:15:00Z', arrivalAt: '2026-11-05T14:40:00Z', flightNumber: 'EK001', aircraft: 'B77W' },
+      { departureAt: '2026-11-06T19:45:00Z', arrivalAt: '2026-11-07T11:20:00Z', flightNumber: 'EK001', aircraft: 'B77W' },
+    ],
+  },
+  'SIN|DXB|HKG': {
+    legs: [
+      { departureAt: '2026-11-05T09:15:00Z', arrivalAt: '2026-11-05T14:40:00Z', flightNumber: 'EK001', aircraft: 'B77W' },
+      { departureAt: '2026-11-06T19:10:00Z', arrivalAt: '2026-11-07T11:05:00Z', flightNumber: 'EK302', aircraft: 'B77W' },
+    ],
+  },
+  'HKG|DXB|JFK': {
+    legs: [
+      { departureAt: '2026-11-05T09:15:00Z', arrivalAt: '2026-11-05T14:40:00Z', flightNumber: 'EK001', aircraft: 'B77W' },
+      { departureAt: '2026-11-05T18:05:00Z', arrivalAt: '2026-11-06T00:25:00Z', flightNumber: 'EK030', aircraft: 'B77W' },
+    ],
+  },
+  'HKG|DXB|SIN': {
+    legs: [
+      { departureAt: '2026-11-05T09:15:00Z', arrivalAt: '2026-11-05T14:40:00Z', flightNumber: 'EK001', aircraft: 'B77W' },
+      { departureAt: '2026-11-06T19:45:00Z', arrivalAt: '2026-11-07T11:20:00Z', flightNumber: 'EK001', aircraft: 'B77W' },
+    ],
+  },
+  'HKG|DXB|HKG': {
+    legs: [
+      { departureAt: '2026-11-05T09:15:00Z', arrivalAt: '2026-11-05T14:40:00Z', flightNumber: 'EK001', aircraft: 'B77W' },
+      { departureAt: '2026-11-06T19:10:00Z', arrivalAt: '2026-11-07T11:05:00Z', flightNumber: 'EK302', aircraft: 'B77W' },
+    ],
+  },
+  'LAX|DXB|SIN': {
+    legs: [
+      { departureAt: '2026-11-05T08:40:00Z', arrivalAt: '2026-11-05T20:10:00Z', flightNumber: 'EK215', aircraft: 'B77W' },
+      { departureAt: '2026-11-06T09:45:00Z', arrivalAt: '2026-11-07T01:20:00Z', flightNumber: 'EK001', aircraft: 'B77W' },
+    ],
+  },
+  'JFK|DXB|SIN': {
+    legs: [
+      { departureAt: '2026-11-05T02:20:00Z', arrivalAt: '2026-11-05T08:30:00Z', flightNumber: 'EK201', aircraft: 'B77W' },
+      { departureAt: '2026-11-06T09:45:00Z', arrivalAt: '2026-11-07T01:20:00Z', flightNumber: 'EK001', aircraft: 'B77W' },
+    ],
+  },
+  'JFK|DXB|HKG': {
+    legs: [
+      { departureAt: '2026-11-05T02:20:00Z', arrivalAt: '2026-11-05T08:30:00Z', flightNumber: 'EK201', aircraft: 'B77W' },
+      { departureAt: '2026-11-06T09:10:00Z', arrivalAt: '2026-11-07T01:05:00Z', flightNumber: 'EK302', aircraft: 'B77W' },
+    ],
+  },
+};
+
 
 /** Cabin list for a flight — the flat column carries exactly one cabin. */
 function cabinsFor(product: Product): Json[] {
@@ -183,6 +393,35 @@ function cabinCategoriesFor(product: Product): Json[] {
  * @returns the table written, or null when the type has no extension or a row
  * already exists (so a re-run never clobbers data a feed has populated).
  */
+/**
+ * A comparable fingerprint of an itinerary: the airports, in order, and when
+ * each leg is scheduled.
+ *
+ * Comparing `segmentCount` alone cannot tell `HKG → HKG` from `HKG → SIN` — both
+ * are one leg — so a corrected route reads as unchanged and the stale
+ * `FlightSegment` rows survive.
+ *
+ * The timestamps are part of the signature for the same reason, one level down.
+ * Comparing airports only treats "no times" and "times" as identical, so a
+ * product whose schedule was *added* re-runs the seed, reports the itinerary
+ * unchanged, and keeps its null legs. That is exactly how three connecting
+ * itineraries (`HKG→DXB→LAX`, `SIN→DXB→LAX`, `LAX→DXB→JFK`) stayed schedule-less
+ * after the generator started producing routes the hand-written table does not
+ * name — and a null layover is not filterable, so they survived a one-minute
+ * layover cap and were shown to anyone asking for a tight connection.
+ */
+function routeSignature(segments: unknown): string {
+  if (!Array.isArray(segments)) return '';
+  return segments
+    .map((entry) => {
+      const leg = entry as JsonSegment;
+      const from = leg.departure?.airport ?? '';
+      const to = leg.arrival?.airport ?? '';
+      return `${from}>${to}@${leg.departure?.scheduledAt ?? ''}`;
+    })
+    .join('|');
+}
+
 async function backfillOne(prisma: PrismaClient, product: Product): Promise<string | null> {
   switch (product.type) {
     case 'HOTEL_ROOM': {
@@ -214,15 +453,48 @@ async function backfillOne(prisma: PrismaClient, product: Product): Promise<stri
     }
 
     case 'FLIGHT': {
-      const existing = await prisma.productFlight.findUnique({ where: { productId: product.id } });
-      if (existing) return null;
-
       const segments = segmentsFor(product);
+      const marketingCarrier = product.airlineName ?? 'UNKNOWN';
+      const marketingCarrierCode = carrierCodeFromName(product.airlineName);
+
+      const existing = await prisma.productFlight.findUnique({ where: { productId: product.id } });
+      if (existing) {
+        // A re-run must be able to correct the itinerary. Returning early here
+        // meant a route changed from `SIN → JFK` to `SIN → DXB → JFK` kept
+        // advertising a single leg: the seed reported `flight: 0` and the stale
+        // `segments` blob then propagated into `FlightSegment`.
+        //
+        // Only the shape of the journey is refreshed. `ticketingRules` and
+        // `cabins` are left alone because a supplier feed owns those.
+        //
+        // The comparison covers the airports, not just the leg count. `HKG → HKG`
+        // and `HKG → SIN` are both a single leg, so comparing lengths reported
+        // them as identical and left the stale itinerary in place — which is how
+        // three `FlightSegment` rows ended up saying `HKG → HKG` for a product
+        // whose route read `HKG → SIN`.
+        const sameRoute =
+          existing.segmentCount === segments.length &&
+          existing.marketingCarrier === marketingCarrier &&
+          routeSignature(existing.segments) === routeSignature(segments);
+
+        if (sameRoute) return null;
+        await prisma.productFlight.update({
+          where: { productId: product.id },
+          data: {
+            marketingCarrier,
+            marketingCarrierCode,
+            segmentCount: segments.length,
+            segments,
+          },
+        });
+        return 'flight';
+      }
+
       await prisma.productFlight.create({
         data: {
           productId: product.id,
-          marketingCarrier: product.airlineName ?? 'UNKNOWN',
-          marketingCarrierCode: carrierCodeFromName(product.airlineName),
+          marketingCarrier,
+          marketingCarrierCode,
           segmentCount: segments.length,
           segments,
           cabins: cabinsFor(product),
@@ -327,7 +599,9 @@ async function backfillSearchFacets(prisma: PrismaClient): Promise<number> {
         carrierCode: isFlight ? carrierCodeFromName(product.airlineName) : null,
         carrierName: isFlight ? product.airlineName : null,
         routeSummary: isFlight ? product.flightRoute : null,
-        segmentCount: isFlight ? (route ? 1 : 0) : null,
+        // The true leg count, not 1: a one-stop itinerary has two. Hardcoding 1
+        // made every connecting product advertise itself as direct.
+        segmentCount: isFlight ? Math.max(route ? route.via.length + 1 : 0, 0) : null,
         cabinClasses: isFlight && product.cabinClass ? [product.cabinClass] : [],
         shipName: isCruise ? product.shipName : null,
         cruiseLine: isCruise ? product.cruiseLine : null,
@@ -337,6 +611,154 @@ async function backfillSearchFacets(prisma: PrismaClient): Promise<number> {
     });
   }
   return products.length;
+}
+
+/**
+ * Mirror every `ProductFlight.segments` blob into `FlightSegment` rows.
+ *
+ * The blob is the source of truth for a single-row product read; the rows are
+ * what connection search can index. Rather than re-deriving segments (which
+ * would let the two copies drift), this reads the blob back and projects each
+ * entry, so the row set is by construction the same itinerary.
+ *
+ * Idempotent by comparison, not by skipping: the leg count already stored is
+ * checked against the blob, and only a product whose itinerary actually changed
+ * is rewritten. A bare "rows exist → skip" guard left the very products this
+ * backfill exists for permanently stale — changing a route from `SIN → JFK` to
+ * `SIN → DXB → JFK` re-ran the seed and reported `itineraries: 0`, because the
+ * single old leg was still there.
+ *
+ * @returns the number of products whose itinerary was mirrored.
+ */
+async function backfillFlightSegments(prisma: PrismaClient): Promise<number> {
+  const flights = await prisma.productFlight.findMany({ select: { productId: true, segments: true } });
+
+  let mirrored = 0;
+  for (const flight of flights) {
+    const entries = Array.isArray(flight.segments) ? (flight.segments as JsonSegment[]) : [];
+    if (entries.length === 0) continue;
+
+    const rows = entries
+      .map((entry, index) => toSegmentRow(flight.productId, entry, index))
+      .filter((row): row is Prisma.FlightSegmentCreateManyInput => row !== null);
+    if (rows.length === 0) continue;
+
+    const existing = await prisma.flightSegment.findMany({
+      where: { productId: flight.productId },
+      select: { seq: true, departureAirport: true, arrivalAirport: true, departureScheduledAt: true },
+      orderBy: { seq: 'asc' },
+    });
+
+    // Compare shape *and* schedule. Counting rows is not enough: a stale mirror
+    // can hold the same number of legs as the blob and still be describing a
+    // different journey, which is how a two-leg product kept three rows with no
+    // times while the blob beside it said otherwise.
+    const matches =
+      existing.length === rows.length &&
+      existing.every((row, index) => {
+        const next = rows[index];
+        const wantDeparture = next.departureScheduledAt instanceof Date ? next.departureScheduledAt : null;
+        return (
+          row.seq === next.seq &&
+          row.departureAirport === next.departureAirport &&
+          row.arrivalAirport === next.arrivalAirport &&
+          (row.departureScheduledAt?.getTime() ?? null) === (wantDeparture?.getTime() ?? null)
+        );
+      });
+
+    // Never clobber a richer schedule a feed has filled in: if the stored rows
+    // already carry times the blob does not, and the airports already agree,
+    // leave them alone.
+    const storedHasSchedule = existing.some((row) => row.departureScheduledAt !== null);
+    const blobHasSchedule = rows.some((row) => row.departureScheduledAt !== null);
+    if (matches && !(blobHasSchedule && !storedHasSchedule)) continue;
+
+    // Anything else is rewritten, including a route change on a product whose
+    // itinerary carries no times at all. An earlier draft skipped when both
+    // sides were schedule-less, which is precisely the case that let `HKG → HKG`
+    // rows survive under a product whose route read `HKG → SIN`: the airport
+    // comparison below said "different", and this said "nothing to preserve".
+    // Preserving a schedule is the only reason to skip, so that is the only
+    // reason to skip.
+
+    await prisma.flightSegment.deleteMany({ where: { productId: flight.productId } });
+    await prisma.flightSegment.createMany({ data: rows });
+    mirrored += 1;
+  }
+  return mirrored;
+}
+
+/** The subset of the `segments` blob shape this file needs to project. */
+interface JsonSegment {
+  seq?: number;
+  marketingCarrier?: string | null;
+  operatingCarrier?: string | null;
+  flightNumber?: string | null;
+  aircraft?: string | null;
+  departure?: { airport?: string | null; scheduledAt?: string | null } | null;
+  arrival?: { airport?: string | null; scheduledAt?: string | null } | null;
+  durationMinutes?: number | null;
+  cabinCode?: string | null;
+  bookingClass?: string | null;
+  fareFamily?: string | null;
+}
+
+/**
+ * Project one blob entry into a row, or null when it is unusable.
+ *
+ * A leg with no departure or arrival airport is not a leg. Skipping it rather
+ * than storing a placeholder keeps the `departureAirport`/`arrivalAirport`
+ * columns genuinely non-null, which is what makes the connection index usable.
+ */
+function toSegmentRow(
+  productId: string,
+  entry: JsonSegment,
+  index: number,
+): Prisma.FlightSegmentCreateManyInput | null {
+  const departureAirport = entry.departure?.airport?.trim() || '';
+  const arrivalAirport = entry.arrival?.airport?.trim() || '';
+  if (!departureAirport || !arrivalAirport) return null;
+
+  const departureScheduledAt = toUtcDate(entry.departure?.scheduledAt);
+  const arrivalScheduledAt = toUtcDate(entry.arrival?.scheduledAt);
+  const marketingCarrier = entry.marketingCarrier?.trim() || null;
+
+  return {
+    productId,
+    seq: entry.seq && entry.seq > 0 ? entry.seq : index + 1,
+    marketingCarrier: marketingCarrier ?? 'UNKNOWN',
+    operatingCarrier: entry.operatingCarrier?.trim() || null,
+    marketingCarrierCode: marketingCarrier ? carrierCodeFromName(marketingCarrier) : null,
+    flightNumber: entry.flightNumber?.trim() || null,
+    aircraft: entry.aircraft?.trim() || null,
+    departureAirport,
+    departureTerminal: null,
+    departureScheduledAt,
+    departureActualAt: null,
+    arrivalAirport,
+    arrivalTerminal: null,
+    arrivalScheduledAt,
+    arrivalActualAt: null,
+    // Only trust a stated duration. Deriving it from two timestamps that are
+    // themselves absent would invent precision the schedule does not have.
+    durationMinutes: typeof entry.durationMinutes === 'number' && entry.durationMinutes > 0
+      ? Math.round(entry.durationMinutes)
+      : null,
+    cabinCode: entry.cabinCode?.trim() || null,
+    bookingClass: entry.bookingClass?.trim() || null,
+    fareFamily: entry.fareFamily?.trim() || null,
+  };
+}
+
+/**
+ * Parse a schedule timestamp into a Date, or null when it is absent or
+ * unparseable. A bad timestamp must not become an Invalid Date that Prisma
+ * then writes as the epoch.
+ */
+function toUtcDate(value: string | null | undefined): Date | null {
+  if (!value) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 /**
@@ -366,7 +788,12 @@ export async function backfillCategoryExtensions(
   }
 
   const facets = await backfillSearchFacets(prisma);
-  logger.info('seed.category_extensions_backfilled', { ...counts, searchFacets: facets });
+  const itineraries = await backfillFlightSegments(prisma);
+  logger.info('seed.category_extensions_backfilled', {
+    ...counts,
+    searchFacets: facets,
+    itineraries,
+  });
 
   return counts;
 }

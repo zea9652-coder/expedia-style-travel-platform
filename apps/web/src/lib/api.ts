@@ -104,7 +104,12 @@ export type SearchHit = {
   destinationName: string | null;
   countryCode: string | null;
   distanceKm: number | null;
-  badge: string | null;
+  /**
+   * A highlight code, not display copy. The API decides *what* is true about a
+   * product; the dictionaries decide how to say it, which is what keeps a
+   * Chinese card from showing English words.
+   */
+  badgeCode: 'PRIORITY_ENTRY' | 'PRIVATE_DEPARTURE' | 'INSTANT_CONFIRMATION' | null;
   tags: string[];
   /**
    * Category-specific facts from the API, so a card can show a flight's route
@@ -246,6 +251,12 @@ export type ProductDetail = {
   selectedDate: string;
   quantity: number;
   ticketTypes: TicketType[];
+  /**
+   * Live context for the product, when the API can supply it. Absent for every
+   * non-flight category and for a flight with nothing nearby — a flight the
+   * upstream has no coverage for is a normal state, not an error.
+   */
+  live?: LiveContent | null;
   reviews: {
     id: string;
     rating: number;
@@ -267,8 +278,48 @@ export type ProductDetail = {
     currency: string;
     ratingAvg: number;
     ratingCount: number;
-    badge: string | null;
+    badgeCode: 'PRIORITY_ENTRY' | 'PRIVATE_DEPARTURE' | 'INSTANT_CONFIRMATION' | null;
   }[];
+};
+
+/**
+ * Live air traffic near a flight product, as returned by the API's
+ * `live` block. Mirrors `apps/api/src/modules/supply/live-content.ts`.
+ *
+ * `advisory` is always `true` and is deliberately part of the type: it is
+ * ambient context about the airspace around a destination, never a claim that
+ * any of these aircraft is the traveller's booked flight. The catalogue's
+ * flight numbers are synthetic and cannot be matched to real airframes, so a
+ * UI that presented this as "your flight" would be asserting something false
+ * inside the booking funnel.
+ *
+ * The API only returns airborne traffic — `onGround` is always `false` and
+ * `altitudeFt`/`groundSpeedKt` are populated. Parked aircraft are filtered out
+ * server-side, because between roughly 22:00 and 06:00 UTC they are the only
+ * traffic near a European airport and reporting them would fill this panel with
+ * rows that say nothing. `summary` is therefore always a non-null string when
+ * `live` is present.
+ */
+export type LiveContent = {
+  flights: {
+    icao24: string;
+    callsign: string;
+    registration: string | null;
+    aircraftType: string | null;
+    latitude: number;
+    longitude: number;
+    altitudeFt: number | null;
+    onGround: boolean;
+    groundSpeedKt: number | null;
+    headingDeg: number | null;
+    squawk: string | null;
+    positionTime: number;
+    source: string;
+  }[];
+  summary: string | null;
+  advisory: true;
+  fetchedAt: number;
+  fromCache: boolean;
 };
 
 export type AvailabilityDay = {
@@ -298,6 +349,11 @@ export type CartItem = {
   optionName: string;
   serviceDate: string;
   timeSlot: string | null;
+  /** Stay range. Present only when the line spans more than one night. */
+  checkInDate: string | null;
+  checkOutDate: string | null;
+  nights: number | null;
+  roomTypeCode: string | null;
   quantity: number;
   minPerOrder: number;
   maxPerOrder: number;
@@ -390,6 +446,12 @@ export type OrderDetail = {
     ticketTypeName: string;
     serviceDate: string;
     timeSlot: string | null;
+    /** Stay range. Null on single-date lines. */
+    checkInDate: string | null;
+    checkOutDate: string | null;
+    nights: number | null;
+    roomTypeCode: string | null;
+    nightlyPriceCents: number | null;
     quantity: number;
     lineTotalCents: number;
     destination: string | null;
@@ -653,10 +715,92 @@ export type AuditEntry = {
 };
 
 // ---------------------------------------------------------------------------
+// Support chat
+// ---------------------------------------------------------------------------
+
+export type SupportChatMessage = {
+  id: string;
+  conversationId: string;
+  authorType: 'CUSTOMER' | 'AGENT' | 'SYSTEM';
+  authorName: string | null;
+  body: string;
+  createdAt: string;
+  readAt: string | null;
+};
+
+export type SupportChatConversation = {
+  id: string;
+  subject: string;
+  status: 'OPEN' | 'CLOSED';
+  orderId: string | null;
+  assignedToUserId: string | null;
+  customerUnread: number;
+  staffUnread: number;
+  lastMessageAt: string;
+  lastPreview: string | null;
+  createdAt: string;
+  /** Present on the staff inbox view only. */
+  customer?: { id: string; name: string; email: string } | null;
+};
+
+// ---------------------------------------------------------------------------
 // Endpoints
 // ---------------------------------------------------------------------------
 
 export type SearchParams = Record<string, string | number | boolean | undefined | null>;
+
+/**
+ * A saved payment reference.
+ *
+ * Note what is *absent*: no card number, no expiry, no CVC. The API stores a
+ * gateway token plus display fragments, so there is nothing secret here to leak.
+ */
+export type SavedPaymentMethod = {
+  id: string;
+  channel: string;
+  brand: string | null;
+  last4: string | null;
+  label: string | null;
+  isDefault: boolean;
+  verified: boolean;
+  expiresAt: string | null;
+  createdAt: string;
+};
+
+/**
+ * One movement on the stored-value balance.
+ *
+ * `kind` distinguishes a shopper-funded top-up from a platform credit, which is
+ * why the statement labels it rather than showing the note alone: "Top-up" and
+ * "Adjustment" mean very different things to the person reading it.
+ */
+export type WalletEntry = {
+  id: string;
+  kind: 'TOP_UP' | 'WITHDRAWAL' | 'CREDIT' | 'DEBIT' | 'REFUND' | 'ADJUSTMENT' | 'REVERSAL';
+  amountCents: number;
+  currency: string;
+  balanceAfterCents: number;
+  note: string | null;
+  orderId: string | null;
+  createdAt: string;
+};
+
+export type PaymentChannelOption = {
+  channel: string;
+  /** What the channel needs before it can be saved. */
+  requires?: string[];
+  label?: string;
+};
+
+export type AddPaymentMethodInput = {
+  channel: 'CARD' | 'PAYPAL' | 'CRYPTO_TRC20';
+  label?: string;
+  isDefault?: boolean;
+  card?: { brand: string; last4: string; token?: string; expMonth?: number; expYear?: number };
+  paypal?: { payerId: string; email?: string };
+  crypto?: { address: string; network?: string };
+};
+
 
 function toQuery(params: SearchParams): string {
   const search = new URLSearchParams();
@@ -729,7 +873,14 @@ export const api = {
     locale?: string;
     countryCode?: string;
   }) =>
-    request<{ token: string; user: { id: string; email: string; firstName: string; lastName: string } }>('/auth/register', {
+    request<{
+      token: string;
+      user: { id: string; email: string; firstName: string; lastName: string; emailVerified: boolean };
+      /** `devCode` is only present when the API runs with the console mail
+       * transport outside production, so the end-to-end test can complete the
+       * flow without a mailbox. */
+      emailVerification: { required: boolean; sent: boolean; devCode?: string };
+    }>('/auth/register', {
       method: 'POST',
       body,
     }),
@@ -737,7 +888,14 @@ export const api = {
   login: (body: { email: string; password: string }) =>
     request<{
       token: string;
-      user: { id: string; email: string; firstName: string; lastName: string; loyalty: { tier: string; points: number } | null };
+      user: {
+        id: string;
+        email: string;
+        firstName: string;
+        lastName: string;
+        emailVerified: boolean;
+        loyalty: { tier: string; points: number } | null;
+      };
     }>('/auth/login', { method: 'POST', body }),
 
   me: (token: string) =>
@@ -749,6 +907,7 @@ export const api = {
       phone: string | null;
       locale: string;
       role: string;
+      emailVerified: boolean;
       marketingOptIn: boolean;
       loyalty: {
         tier: string;
@@ -759,6 +918,90 @@ export const api = {
       travelers: { id: string; fullName: string; email: string | null; isDefault: boolean }[];
       stats: { orders: number; reviews: number; wishlist: number };
     }>('/auth/me', { token, cache: 'no-store' }),
+
+  /** Confirms an email address with the 6-digit code from registration. */
+  verifyEmail: (body: { email: string; code: string }) =>
+    request<{ verified: boolean; alreadyVerified: boolean }>('/auth/verify-email', { method: 'POST', body }),
+
+  /** Re-sends a verification code. Always answers `sent: true`. */
+  resendVerification: (body: { email: string }) =>
+    request<{ sent: boolean; devCode?: string }>('/auth/resend-verification', { method: 'POST', body }),
+
+  // --- Account centre ---
+  // Saved methods are references only: the API returns a brand + last four and
+  // never a card number, because it never accepts one.
+  accountOverview: (token: string) =>
+    request<{
+      profile: {
+        id: string;
+        email: string;
+        firstName: string;
+        lastName: string;
+        phone: string | null;
+        locale: string;
+        countryCode: string | null;
+        avatarUrl: string | null;
+        marketingOptIn: boolean;
+        emailVerified: boolean;
+        memberSince: string;
+      };
+      wallet: { balanceCents: number; enabled: boolean };
+      loyalty: { tier: string; points: number } | null;
+      travelers: { id: string; fullName: string; email: string | null; isDefault: boolean }[];
+      paymentMethods: SavedPaymentMethod[];
+      stats: { orders: number; reviews: number; wishlist: number };
+      channels: PaymentChannelOption[];
+    }>('/account/overview', { token, cache: 'no-store' }),
+
+  paymentMethods: (token: string) =>
+    request<{ methods: SavedPaymentMethod[]; channels: PaymentChannelOption[] }>('/account/payment-methods', {
+      token,
+      cache: 'no-store',
+    }),
+
+  addPaymentMethod: (token: string, body: AddPaymentMethodInput) =>
+    request<SavedPaymentMethod>('/account/payment-methods', { method: 'POST', body, token }),
+
+  setDefaultPaymentMethod: (token: string, id: string) =>
+    request<{ ok: boolean; defaultId: string }>(`/account/payment-methods/${id}`, {
+      method: 'PATCH',
+      body: { isDefault: true },
+      token,
+    }),
+
+  removePaymentMethod: (token: string, id: string) =>
+    request<{ ok: boolean; removedId: string }>(`/account/payment-methods/${id}`, { method: 'DELETE', token }),
+
+  paymentChannels: (token: string) =>
+    request<{ stage: string; channels: { channel: string; enabled: boolean; liveSettlement: boolean }[] }>(
+      '/account/payment-channels',
+      { token, cache: 'no-store' },
+    ),
+
+  // --- Stored-value balance (top-up / withdraw) ---
+  wallet: (token: string) =>
+    request<{
+      balanceCents: number;
+      enabled: boolean;
+      currency: string;
+      entries: WalletEntry[];
+    }>('/account/wallet', { token, cache: 'no-store' }),
+
+  /** 充值 — adds spendable credit. */
+  topUpWallet: (token: string, body: { amountCents: number; channel: 'CARD' | 'PAYPAL' | 'CRYPTO_TRC20' }) =>
+    request<{ balanceCents: number; transactionId: string; currency: string }>('/account/wallet/top-up', {
+      method: 'POST',
+      body,
+      token,
+    }),
+
+  /** 取现 — pays credit back out. */
+  withdrawWallet: (token: string, body: { amountCents: number; destination: string }) =>
+    request<{ balanceCents: number; transactionId: string; currency: string }>('/account/wallet/withdraw', {
+      method: 'POST',
+      body,
+      token,
+    }),
 
   // --- Checkout & orders ---
   createOrder: (body: {
@@ -785,7 +1028,19 @@ export const api = {
     }),
 
   addCartItem: (
-    body: { ticketTypeId: string; serviceDate: string; timeSlot?: string | null; quantity: number },
+    body: {
+      ticketTypeId: string;
+      serviceDate: string;
+      timeSlot?: string | null;
+      /**
+       * Departure morning. Supplying it makes the line a stay: the server keeps
+       * every night in the range held and bills per night. Omit for a
+       * single-date ticket.
+       */
+      checkOutDate?: string;
+      roomTypeCode?: string;
+      quantity: number;
+    },
     token?: string | null,
     guestToken?: string | null,
     locale: LocaleCode = DEFAULT_LOCALE,
@@ -1130,6 +1385,62 @@ export const api = {
 
   supportAudit: (params: SearchParams, token: string) =>
     request<{ items: AuditEntry[] }>(`/support/audit${toQuery(params)}`, { token, cache: 'no-store' }),
+
+  // --- Support chat: shopper side ---
+  openChat: (body: { subject?: string; orderId?: string; message?: string }, token: string) =>
+    request<SupportChatConversation>('/support/conversations', { method: 'POST', body, token }),
+
+  myChats: (token: string) =>
+    request<{ items: SupportChatConversation[]; unread: number }>('/support/conversations/mine', {
+      token,
+      cache: 'no-store',
+    }),
+
+  chatThread: (id: string, token: string) =>
+    request<{ conversation: SupportChatConversation; messages: SupportChatMessage[]; unread: number }>(
+      `/support/conversations/${encodeURIComponent(id)}`,
+      { token, cache: 'no-store' },
+    ),
+
+  sendChatMessage: (id: string, body: string, token: string) =>
+    request<SupportChatMessage>(`/support/conversations/${encodeURIComponent(id)}/messages`, {
+      method: 'POST',
+      body: { body },
+      token,
+    }),
+
+  // --- Support chat: staff side ---
+  supportInbox: (params: SearchParams, token: string) =>
+    request<{ items: SupportChatConversation[]; unread: number }>(`/support/inbox${toQuery(params)}`, {
+      token,
+      cache: 'no-store',
+    }),
+
+  supportConversation: (id: string, token: string) =>
+    request<{ conversation: SupportChatConversation; messages: SupportChatMessage[]; unread: number }>(
+      `/support/inbox/${encodeURIComponent(id)}`,
+      { token, cache: 'no-store' },
+    ),
+
+  supportReply: (id: string, body: string, token: string) =>
+    request<SupportChatMessage>(`/support/inbox/${encodeURIComponent(id)}/messages`, {
+      method: 'POST',
+      body: { body },
+      token,
+    }),
+
+  supportAssign: (id: string, token: string, assignedToUserId?: string | null) =>
+    request<SupportChatConversation>(`/support/inbox/${encodeURIComponent(id)}/assign`, {
+      method: 'POST',
+      body: { assignedToUserId },
+      token,
+    }),
+
+  supportCloseConversation: (id: string, token: string) =>
+    request<SupportChatConversation>(`/support/inbox/${encodeURIComponent(id)}/close`, { method: 'POST', token }),
+
+  supportReopenConversation: (id: string, token: string) =>
+    request<SupportChatConversation>(`/support/inbox/${encodeURIComponent(id)}/reopen`, { method: 'POST', token }),
 };
 
 export { API_BASE };

@@ -1,12 +1,37 @@
 import type { Metadata, Viewport } from 'next';
+import { Inter, Noto_Sans_SC } from 'next/font/google';
 import './globals.css';
 import { Footer } from '@/components/Footer';
 import { Header } from '@/components/Header';
 import { LocaleSwitcher } from '@/components/LocaleSwitcher';
 import { RealtimeProvider } from '@/components/RealtimeProvider';
-import { resolveServerLocale } from '@/lib/i18n/config';
+import { SupportWidget } from '@/components/SupportWidget';
+import { resolveServerLocale, htmlLang } from '@/lib/i18n/config';
 import { createTranslator } from '@/lib/i18n/dictionaries';
 import { brandName, brandTagline } from '@/lib/brand';
+
+/**
+ * Self-hosted webfonts.
+ *
+ * The catalogue is bilingual, but `--font-sans` listed only Latin families, so a
+ * Chinese page fell through to whatever CJK font the OS happened to have — which
+ * on a Linux box with no CJK font installed is an ugly synthetic fallback. These
+ * two give both scripts a real face, and `next/font` downloads and self-hosts
+ * them at build time, so there is no runtime request to Google and no layout
+ * shift (`display: swap` plus a metric-compatible fallback).
+ */
+const inter = Inter({
+  subsets: ['latin'],
+  display: 'swap',
+  variable: '--font-latin',
+});
+
+const notoSansSC = Noto_Sans_SC({
+  subsets: ['latin'],
+  weight: ['400', '500', '700'],
+  display: 'swap',
+  variable: '--font-cjk',
+});
 
 /**
  * Metadata is generated per-request so the brand name, the page title and the
@@ -84,7 +109,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
   const t = createTranslator(locale);
 
   return (
-    <html lang={locale === 'zh' ? 'zh-CN' : 'en'}>
+    <html lang={htmlLang(locale)} className={`${inter.variable} ${notoSansSC.variable}`}>
       <body>
         <a className="skip-link" href="#main">
           {t('nav.skipToContent')}
@@ -101,6 +126,9 @@ export default async function RootLayout({ children }: { children: React.ReactNo
           <Header locale={locale} />
           <main id="main">{children}</main>
           <Footer locale={locale} />
+          {/* The shopper's end of the support chat. It hides itself inside the
+              staff consoles, so mounting it once here is safe. */}
+          <SupportWidget locale={locale} />
         </RealtimeProvider>
       </body>
     </html>

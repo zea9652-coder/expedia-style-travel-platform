@@ -41,6 +41,11 @@ import { refreshAvailabilityCalendar } from '../src/modules/search/service';
 import { DESTINATIONS, MERCHANTS, type SeedDestination, type SeedPriceRule, type SeedProduct } from './seed-data';
 import { COUPONS, PRODUCTS } from './seed-products';
 import { backfillCategoryExtensions } from './seed-category-extensions';
+import { seedBundles } from './seed-bundles';
+import { reindexAll } from '../src/modules/search/service';
+import { setAirportsByCity, type AirportIndex } from './seed-global';
+import { airportsWithin } from './nearest-airport';
+import { CITIES } from './seed-cities';
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -140,6 +145,24 @@ async function main() {
   }
 
   logger.info('seed.merchants', { count: merchantBySlug.size });
+
+  // -------------------------------------------------------------------------
+  // 2b. Real departure airports, from the OurAirports import.
+  //
+  // Flight routes need an airport the city actually departs from. Previously
+  // both ends of a route came from the same hand-written `HUBS` list, so they
+  // could coincide and the catalogue grew `JFK → JFK` products — seven of the
+  // 34 flights. Resolving the departure from geography removes the possibility.
+  //
+  // Optional by design: the import may not have been run, and a weaker route
+  // beats a broken seed. See `pnpm supply:import` and docs/supply-sources.md.
+  // -------------------------------------------------------------------------
+  const airportIndex = await buildAirportIndex();
+  setAirportsByCity(airportIndex);
+  logger.info('seed.departure_airports', {
+    cities: airportIndex.size,
+    airports: [...airportIndex.values()].reduce((sum, list) => sum + list.length, 0),
+  });
 
   // -------------------------------------------------------------------------
   // 3. Products, variants, media, rules, inventory
@@ -312,6 +335,15 @@ async function main() {
           basePriceCents: variant.basePriceCents,
           compareAtCents: variant.compareAtCents ?? null,
           costCents: variant.costCents,
+          // Present in `update` as well as `create`. Omitting it here meant the
+          // seed's own configuration was the only thing that could set a
+          // currency: re-seeding after moving the platform to a single currency
+          // rewrote every price and left all 677 rows denominated in whatever
+          // they were created with. A seed that cannot re-apply its own
+          // configuration is not idempotent, and the two columns have to move
+          // together — a new `basePriceCents` in a stale currency is a wrong
+          // price, not a neutral one.
+          currency: variant.currency ?? 'USD',
           taxBps: variant.taxBps ?? 0,
           feeBps: variant.feeBps ?? 0,
           inventoryMode: (variant.inventoryMode ?? 'PER_DATE') as InventoryMode,
@@ -477,44 +509,6 @@ async function main() {
     });
   }
 
-  await prisma.promotion.deleteMany({});
-  await prisma.promotion.createMany({
-    data: [
-      {
-        slug: 'summer-city-breaks',
-        title: 'City breaks from $19',
-        subtitle: 'Museums, tours and cruises across Europe and the US',
-        body: 'Book a museum pass, a guided tour or a sunset cruise and save on the usual city break prices.',
-        ctaLabel: 'Browse city breaks',
-        ctaUrl: '/search?sort=PRICE_ASC',
-        startsAt: new Date(Date.now() - 86_400_000),
-        endsAt: addDays(new Date(), 90),
-        position: 1,
-      },
-      {
-        slug: 'family-adventure',
-        title: 'Family days out made easy',
-        subtitle: 'Kids go free deals and family bundles',
-        body: 'Family bundles that bundle the tickets, the guides and the queue-skipping into one price.',
-        ctaLabel: 'See family offers',
-        ctaUrl: '/search?tags=family',
-        startsAt: new Date(Date.now() - 86_400_000),
-        endsAt: addDays(new Date(), 120),
-        position: 2,
-      },
-      {
-        slug: 'free-cancellation',
-        title: 'Plans change. Free cancellation on thousands of experiences.',
-        subtitle: 'Cancel up to 24 hours before for a full refund',
-        ctaLabel: 'Browse flexible options',
-        ctaUrl: '/search?freeCancellation=true',
-        startsAt: new Date(Date.now() - 86_400_000),
-        endsAt: addDays(new Date(), 180),
-        position: 3,
-      },
-    ],
-  });
-
   // -------------------------------------------------------------------------
   // 5. Add-ons
   // -------------------------------------------------------------------------
@@ -563,6 +557,18 @@ async function main() {
   // -------------------------------------------------------------------------
   await backfillCategoryData();
 
+  // 11. Rebuild the denormalised search index.
+  //
+  //     `reindexAll` existed and was never called from anywhere. Search reads
+  //     `ProductSearchBlob`, which the seed writes once and never refreshes, so
+  //     any product field the seed later corrects stayed wrong for search: a
+  //     flight reseeded from `SIN → JFK` to `SIN → DXB → JFK` was still
+  //     indexed as direct, and `?q=london-international-flight` returned zero
+  //     hits for a product that plainly existed.
+  // ---------------------------------------------------------------------------
+  const reindexed = await reindexAll();
+  logger.info('seed.search_reindexed', { products: reindexed });
+
   logger.info('seed.done');
 }
 
@@ -582,18 +588,29 @@ async function ensureCustomer() {
       role: UserRole.CUSTOMER,
       locale: 'en-US',
       countryCode: 'US',
+      // Demo accounts skip the email-verification step: the code lives in the
+      // API log (MAIL_TRANSPORT=console), which is fine for a human but would
+      // make every seeded order depend on reading that log. Verification is
+      // exercised end to end on a freshly registered account instead.
+      emailVerifiedAt: new Date(),
       loyaltyAccount: { create: { tier: LoyaltyTier.GOLD, points: 18_400, lifetimePoints: 21_200 } },
       travelerProfiles: { create: { fullName: 'Alex Traveler', email, isDefault: true } },
     },
-    update: {},
+    update: { emailVerifiedAt: new Date() },
   });
 }
 
+/**
+ * The platform has exactly two staff surfaces, so it has exactly two staff logins.
+ *
+ * `operator@` and `merchant@` used to exist alongside these; their capabilities
+ * (gate scanning, partner views) are ADMIN capabilities now. Those accounts are
+ * retired below rather than left behind, because a demo credential that no longer
+ * maps to a role is worse than no credential at all.
+ */
 async function ensureStaff() {
   const staff = [
     { email: 'admin@easytrip.test', role: UserRole.ADMIN, firstName: 'Ops', lastName: 'Admin' },
-    { email: 'operator@easytrip.test', role: UserRole.OPERATOR, firstName: 'Gate', lastName: 'Staff' },
-    { email: 'merchant@easytrip.test', role: UserRole.MERCHANT, firstName: 'Partner', lastName: 'Manager' },
     // SUPPORT sits below ADMIN: able to fix a customer's record and issue a
     // goodwill refund, unable to touch pricing or simulate payments.
     { email: 'support@easytrip.test', role: UserRole.SUPPORT, firstName: 'Casey', lastName: 'Support' },
@@ -608,17 +625,31 @@ async function ensureStaff() {
         firstName: person.firstName,
         lastName: person.lastName,
         role: person.role,
+        emailVerifiedAt: new Date(),
         loyaltyAccount: { create: { tier: LoyaltyTier.MEMBER } },
       },
-      update: { role: person.role },
+      update: { role: person.role, emailVerifiedAt: new Date() },
     });
   }
 
-  // Attach the merchant login to the first partner merchant.
-  const merchantUser = await prisma.user.findUnique({ where: { email: 'merchant@easytrip.test' } });
+  // Retire the two dissolved roles. Best-effort: a database whose demo accounts
+  // have picked up orders must not fail the whole seed because a delete is
+  // restricted — the rows are reassigned by `migrate:roles` either way.
+  try {
+    const retired = await prisma.user.deleteMany({
+      where: { email: { in: ['operator@easytrip.test', 'merchant@easytrip.test'] } },
+    });
+    if (retired.count > 0) logger.info('seed.staff_retired', { count: retired.count });
+  } catch (error) {
+    logger.warn('seed.staff_retire_skipped', { reason: (error as Error).message });
+  }
+
+  // The partner merchant still needs an owner so the demo catalogue has a
+  // provenance chain; the admin holds it now that there is no merchant login.
+  const adminUser = await prisma.user.findUnique({ where: { email: 'admin@easytrip.test' } });
   const partner = await prisma.merchant.findFirst({ where: { slug: 'big-apple-attractions' } });
-  if (merchantUser && partner && !partner.ownerUserId) {
-    await prisma.merchant.update({ where: { id: partner.id }, data: { ownerUserId: merchantUser.id } });
+  if (adminUser && partner && !partner.ownerUserId) {
+    await prisma.merchant.update({ where: { id: partner.id }, data: { ownerUserId: adminUser.id } });
   }
 }
 
@@ -950,8 +981,52 @@ async function backfillTicketArtifacts(): Promise<void> {
  * Idempotent and non-destructive — it upgrades an existing database in place.
  * See `seed-category-extensions.ts` for what it can and cannot derive.
  */
+/**
+ * Resolve each city's real departure airports from the OurAirports import.
+ *
+ * Cities carry an anchor coordinate; the airports carry real ones. Matching
+ * them is a nearest-neighbour question, and the answer is only as good as the
+ * radius — 60km catches a city's metro airports (London Heathrow, Stansted,
+ * Gatwick, City) without reaching the next city over.
+ *
+ * Returns an empty map when the import has not been run, and `flightProduct`
+ * then falls back. That is the right failure: a missing optional dataset
+ * should degrade the catalogue, not abort the seed.
+ */
+async function buildAirportIndex(): Promise<AirportIndex> {
+  const index: AirportIndex = new Map();
+
+  const airports = await prisma.destination.findMany({
+    where: { level: 'AIRPORT', iataCode: { not: null } },
+    select: { iataCode: true, name: true, latitude: true, longitude: true },
+  });
+  if (airports.length === 0) return index;
+
+  const usable = airports
+    .filter((a): a is typeof a & { iataCode: string; latitude: number; longitude: number } =>
+      a.iataCode !== null && a.latitude !== null && a.longitude !== null,
+    )
+    .map((a) => ({ iataCode: a.iataCode, name: a.name, latitude: a.latitude, longitude: a.longitude }));
+
+  for (const city of CITIES) {
+    const nearby = airportsWithin(city.anchor, usable, 60, 3);
+    // A city with no airport within range gets none: inventing a departure
+    // would put the product in the wrong country, which is worse than letting
+    // the factory use its documented fallback.
+    if (nearby.length > 0) {
+      index.set(
+        city.slug,
+        nearby.map((a) => ({ iataCode: a.iataCode, latitude: a.latitude, longitude: a.longitude })),
+      );
+    }
+  }
+
+  return index;
+}
+
 async function backfillCategoryData(): Promise<void> {
   await backfillCategoryExtensions(prisma);
+  await seedBundles(prisma);
 }
 
 main()

@@ -29,12 +29,30 @@ All eight domains are live, not sketched:
 | **Reviews & social** | Verified-purchase reviews, rating breakdown, merchant replies, helpful votes, save/remove journeys in the signed-in wishlist. |
 | **Loyalty & marketing** | Tiered points programme, earn on booking, redeem for credit, coupons (`WELCOME10`, `SAVE25`, `FIRSTTIMEBIG`), and **bilingual promo banners** an operator can create, schedule and place on the storefront without a deploy. |
 | **Itinerary & map** | Multi-day trip plans with geolocated stops, timezone-aware; customers can create plans and add confirmed bookings from their account. |
+| **Accounts & wallets** | Email-verified registration (a 6-digit code, stored only as a hash, single-use and attempt-capped; checkout is gated on it). Stored-value wallet with **top-up and withdrawal**, each writing a `WalletTransaction` so the balance is always explained by its statement. Saved payment methods are *references* — brand and last four, never a card number. |
 | **Operations backend** | Three separate surfaces (customer / operations / support), KPI dashboard, order/inventory tables, double-entry ledger (`GROSS_SALES`, `TAX_PAYABLE`, `PLATFORM_FEE`, `MERCHANT_PAYABLE`, `REFUNDS`, `MARKETING_FEE`), audit log. |
 
 The API smoke suite covers the booking lifecycle—search → detail → calendar → checkout →
 hold → pay → issue → scan → redeem → cancel → refund—and exercises guest carts, multi-line
 checkout, wishlist management, and adding confirmed bookings to trip plans. Run
 `bash scripts/smoke-test.sh` to verify it against the configured development database.
+
+> **Inventory feed (opt-in, off by default).** A staging-only importer can pull third-party
+> hotel rows from an Apify actor into `ScrapedInventory`. Nothing there is sellable: an operator
+> must promote a row by hand into a first-party product, priced from our own cost basis. The
+> feature is flag-gated off (`INVENTORY_FEED_ENABLED=false`), so the first-party scope above is
+> unchanged — see [`docs/adr/0001-inventory-feed-positioning.md`](./docs/adr/0001-inventory-feed-positioning.md).
+> `pnpm inventory:contract` enforces, offline, that the ingest path cannot touch anything the
+> booking engine prices from.
+>
+> **Credentials: data access ≠ transaction.** Every supply source is classified in
+> `apps/api/src/modules/supply/credentials.ts` as `PUBLIC` / `API_KEY` / `SUPPLIER` /
+> `BOOKING` / `SETTLEMENT`, and the last two are *transaction* credentials. This stage is
+> bounded to **read-only supply** — `pnpm credentials:contract` asserts that no enabled source
+> can book or settle. The account centre (`/account`) stores payment methods as **references
+> only** (a gateway token + brand + last four; never a card number), and the PayPal and TRC20
+> rails are **sandbox-only** and refuse `live` outright. See
+> [`docs/supply-sources.md`](./docs/supply-sources.md#credential-classification).
 
 ---
 
@@ -121,6 +139,8 @@ pnpm db:seed                 # catalogue, inventory, demo orders, staff accounts
 pnpm dev:api                 # Fastify on :4000
 pnpm dev:web                 # Next.js on :3000
 pnpm smoke                   # end-to-end API test suite
+pnpm audit:schema            # find columns written but never read
+pnpm supply:import          # import airports from open data (~4,000)
 pnpm typecheck               # both packages
 ```
 
@@ -146,13 +166,17 @@ All use the password **`Password123!`**.
 | Email | Role | What they can see |
 | --- | --- | --- |
 | `traveler@easytrip.test` | Customer | Bookings, e-tickets, points, reviews |
-| `admin@easytrip.test` | Admin | Dashboard, ledger, coupons, audit, staff tools |
-| `operator@easytrip.test` | Operator | Gate scanner at `/admin/scan` |
-| `merchant@easytrip.test` | Merchant | Own products and payouts |
-| `support@easytrip.test` | Support | Customer lookup, wallet adjustments, goodwill refunds, coupon verification |
+| `admin@easytrip.test` | Admin | Everything: dashboard, ledger, coupons, audit, catalogue, gate scanner at `/admin/scan` |
+| `support@easytrip.test` | Support | Live chat inbox, customer lookup, wallet adjustments, goodwill refunds, coupon verification |
 
-The login page has one-click fill buttons for the customer and staff accounts.
+The login page has one-click fill buttons for these accounts.
 
+> **There are exactly two staff roles, and two staff consoles.** `OPERATOR` (gate
+> scanning) and `MERCHANT` (a partner's products) were folded into `ADMIN`: gate scanning
+> is an operations capability, and a partner merchant is a *data model* (`Merchant` still
+> owns inventory and settles commissions) rather than a permission. See
+> [`docs/adr/0002-two-staff-surfaces.md`](./docs/adr/0002-two-staff-surfaces.md).
+>
 > **Support sits *below* admin on purpose.** The cheapest way to stop an agent from
 > breaking pricing is to never let them reach it: `SUPPORT` cannot touch the catalogue,
 > pricing rules, inventory or staff accounts. Every support mutation writes an
@@ -215,6 +239,48 @@ consumes it, and abandonment or a background sweep releases it. A sweeper runs e
 transfers are all `Product → TicketType`. The booking engine has exactly one code path,
 which is why adding a category doesn't mean adding a subsystem.
 
+**Hotel stays are priced and held per night, not per booking.** Supplying `checkOutDate` on
+a cart item turns it into a stay: nights = `checkOut − checkIn`, the line total becomes
+`rate × rooms × nights`, and every night in the range is held. A 3-night booking is one
+`InventoryHoldGroup` owning three `InventoryHold` rows — one per night — so checkout,
+payment and expiry each act on the whole set while `releaseHold`/`consumeHold` keep the
+signatures they always had. Holds are **all-or-nothing**: if any night is unavailable the
+group is discarded and no night stays blocked. `ProductStay.policies` carries `minNights` /
+`maxNights`, enforced before a hold is placed.
+
+**Packages are not booked — they are expanded.** A `ProductBundle` lists component
+`TicketType`s with an optional `startOffsetDays`, so "flight + 3 nights" is one purchasable
+thing. Adding one to a cart writes its components as separate lines (the flight as a
+single-date line, the hotel as a 3-night stay) and the package itself never becomes a line —
+otherwise checkout would bill for the bundle *and* its parts. Checkout then holds and prices
+them as one order, so a package is all-or-nothing across categories. The headline price is
+derived from live component prices at read time rather than stored, so it cannot drift when a
+component reprices.
+
+**One shape for the spine, category tables for the depth.** `Product → TicketType → OrderItem`
+stays the single transactional path. On top of it, `ProductStay`, `ProductFlight`,
+`ProductSailing` and `ProductVehicle` carry the structure a flat column cannot express — a
+room grid, ordered flight segments, cabin categories, sailing ports. They are 1:1 extensions
+keyed on `productId`, so nothing in the booking path had to change to adopt them.
+
+`GET /products/:slug` returns whichever of `stay` / `flight` / `sailing` / `vehicle` / `bundle`
+applies, and `null` for the rest — a hotel does not report a ship. A stay carries its room
+grid, check-in/check-out times and policies; a flight its ordered segments, cabins and fare
+families; a cruise its ship, sailing ports and cabin categories; a package its components
+but deliberately no stored price. Expect `null` inside these blocks for anything a supplier
+feed has not supplied: a carrier code, a port, a sail date. Absent means "unknown", not zero.
+
+Inventory carries a `dimensionKey` alongside the existing `timeSlot`, so a hotel can hold
+stock per room type and a cruise per cabin without a new inventory table. Existing rows keep
+`dimensionKey = ""` and behave exactly as before.
+
+`/search` exposes the derived facets — `starRating` and `boardBasis` for hotels, `carrierName`
+and `routeSummary` for flights, `shipName` for cruises — as both response fields and
+CSV filters (`?type=HOTEL_ROOM&stars=4,5`). They are backfilled from the flat columns by
+`seed-category-extensions.ts`, which is idempotent and marks every value it could not derive
+as `null` rather than inventing one. Treat those nulls as "not yet supplied by a feed", not
+as real data.
+
 **Graceful degradation everywhere.** Redis → in-memory; OpenSearch → Postgres; S3 → local
 disk. The platform boots and works with only Postgres running, which keeps onboarding and
 CI honest.
@@ -232,8 +298,8 @@ The platform ships as three visually and logically distinct surfaces:
 | Surface | Route | Who | Cannot see |
 | --- | --- | --- | --- |
 | **Storefront** | `/`, `/search`, `/products/*`, `/cart`, `/checkout`, `/orders`, `/tickets`, `/wishlist`, `/itineraries`, `/loyalty` | Customers | Anything staff-related |
-| **Operations** | `/admin`, `/admin/finance`, `/admin/scan`, `/admin/promo` | Admin, Operator, Merchant | — |
-| **Support** | `/support`, `/support/orders`, `/support/coupons`, `/support/audit` | Support, Admin | Catalogue, pricing rules, inventory, staff accounts |
+| **Operations** | `/admin`, `/admin/finance`, `/admin/scan`, `/admin/promo` | Admin | — |
+| **Support** | `/support/inbox`, `/support`, `/support/orders`, `/support/coupons`, `/support/audit` | Support, Admin | Catalogue, pricing rules, inventory, staff accounts |
 
 Each console gets its own colour identity (admin = brand blue, support = teal) so an
 operator working across a handover can tell at a glance which surface they are in — the
@@ -321,13 +387,56 @@ The support console is deliberately narrower than admin:
 
 Base URL `/api/v1`. Auth via `Authorization: Bearer <token>`.
 
-**Discovery** — `GET /search`, `/destinations`, `/collections/:slug`
+**Discovery** — `GET /search`, `/destinations`, `/collections/:slug`,
+`/search/connections`, `/search/connections/points`,
+`/search/airports`, `/search/airports/:iata/source`,
+`/search/flights/live`, `/search/flights/:callsign/live`
+Category facet filters: `stars`, `carriers`, `carrierCodes`, `ships`,
+`destinationPorts`, `boardBasis` (comma-separated). Values
+outside the valid range are dropped rather than rejected, so a bad chip value degrades to
+"no filter" instead of a 4xx.
+
+`/search/connections?airport=DXB&requireChange=true` answers "which itineraries
+stop at DXB" from the `FlightSegment` table, with optional `minLayoverMinutes`
+/ `maxLayoverMinutes` / `maxDurationMinutes`. `requireChange` is what separates
+*via* DXB from *to* DXB — without it the first leg of every DXB departure counts
+as a connection. `/search/connections/points` summarises every intermediate
+airport the catalogue actually routes through, with the median layover. It is
+empty rather than fabricated when no product has a second leg.
+
+`/search/airports` serves the airport directory imported from open data
+(`pnpm supply:import`, ~4,000 airports with IATA/ICAO codes and coordinates).
+`near=lat,lng&radiusKm=N` ranks by real great-circle distance.
+`/search/airports/:iata/source` returns the provenance and licence of an
+imported row, so attribution is answerable from the data. See
+[`docs/supply-sources.md`](./docs/supply-sources.md).
+
+`/search/flights/live?lat=&lng=&radiusNm=` and
+`/search/flights/:callsign/live` answer "where is this aircraft right now"
+from community ADS-B networks. These are live queries, never imports:
+positions live in a short cache and are never persisted, and the source that
+answered travels on every item. See
+[`docs/supply-sources.md`](./docs/supply-sources.md) ("Real-time sources").
 **Products** — `GET /products/:slug`, `/products/:slug/availability`, `/products/:slug/nearby`
 **Auth** — `POST /auth/register`, `/auth/login`; `GET|PATCH /auth/me`; `POST /auth/travelers`
+**Email verification** — `POST /auth/verify-email` (6-digit code), `POST /auth/resend-verification`.
+Registration issues a code; a signed-in but unverified account is refused at
+`POST /orders` with `403 EMAIL_NOT_VERIFIED`.
+**Account & wallet** — `GET /account/overview`, `/account/payment-methods`,
+`/account/payment-channels`; `POST /account/payment-methods`.
+`GET /account/wallet` (balance + statement), `POST /account/wallet/top-up`,
+`POST /account/wallet/withdraw`. Amounts are integer minor units; both movements
+append a `WalletTransaction`.
+**Support chat** — `POST /support/conversations`, `GET /support/conversations/mine`,
+`GET /support/conversations/:id`, `POST /support/conversations/:id/messages` (shopper);
+`GET /support/inbox`, `/support/inbox/:id`, `POST /support/inbox/:id/messages`,
+`/support/inbox/:id/assign`, `/support/inbox/:id/close`, `/support/inbox/:id/reopen` (staff).
 **Orders** — `POST /orders`, `GET /orders`, `/orders/:id`, `/orders/lookup`,
 `POST /orders/:id/pay`, `GET /orders/:id/cancellation-quote`, `POST /orders/:id/cancel`
 **Cart** — `GET /cart`, `POST /cart/items`, `PATCH|DELETE /cart/items/:id`,
-`POST /cart/checkout` (guest carts use the returned `X-Cart-Token`; inventory is held only at checkout)
+`POST /cart/checkout` (guest carts use the returned `X-Cart-Token`; inventory is held only at checkout).
+Add `checkOutDate` alongside `serviceDate` to book a stay — the item records `nights`,
+and order lines come back with `checkInDate` / `checkOutDate` / `nightlyPriceCents`.
 **Payments** — `POST /webhooks/payment`
 **Tickets** — `GET /tickets`, `/tickets/:ticketNumber`, `POST /tickets/:ticketNumber/transfer`,
 `/tickets/transfer/:token/accept`, `/tickets/recover`
@@ -358,15 +467,88 @@ Operations: `GET /health`, `GET /ready` (per-dependency readiness).
 ## Testing
 
 ```bash
-bash scripts/smoke-test.sh    # 55 checks, requires both services running
-bash scripts/mobile-check.sh  # 40 checks, responsive layer regression guard
+bash scripts/smoke-test.sh    # 102 checks, requires both services running
+bash scripts/mobile-check.sh  # 41 checks, responsive layer regression guard
+bash scripts/schema-audit.sh  # finds columns a seed writes but no route reads
+node scripts/check-images.mjs # every seed image URL must answer 200
+tsx scripts/check-media.ts    # no photograph is reused across the catalogue
+tsx scripts/catalogue-report.ts # catalogue invariants: names, photos, prices, variants
+node scripts/check-i18n-keys.mjs # en/zh key parity, and no dangling t('…') keys
 pnpm typecheck                # strict TS across api + web
 pnpm --filter @easytrip/web build
-pnpm verify                   # typecheck + smoke + realtime + mobile, one command
+pnpm verify                   # typecheck + schema audit + contracts + smoke + realtime + mobile
 ```
 
-The smoke suite is end-to-end against a live stack — it books a real order, pays it,
-redeems the ticket at the gate, and asserts the second scan is rejected.
+The smoke suite is end-to-end against a live stack — it registers, verifies the emailed
+code, books a real order, pays it, redeems the ticket at the gate, and asserts the second
+scan is rejected. It also asserts that an **unverified** account is refused at checkout
+and that a customer token cannot reach the staff support inbox.
+
+`pnpm verify` runs an offline contract gate per subsystem before the live suites:
+`supply:contract`, `inventory:contract`, `auth:contract` (a verification code is never
+stored in the clear; one failure message; checkout gating) and `support-chat:contract`
+(customer reads are always scoped by the token's user).
+
+Two cheaper gates guard failure modes that are invisible to `tsc`:
+
+- **`check:images`** HEAD-checks every image URL the seed writes. Thirteen of sixty-one
+  had silently 404'd, which is why destination tiles rendered as grey boxes; nothing in
+  the type system or the test suite could see it.
+- **`check:media`** asserts no photograph is used by two products, and that every product
+  has one. The catalogue used to draw from a pool of three or four images per category,
+  which put a single Rome Colosseum frame on thirty cards. Images are now handed out at
+  most once from `photo-pools.ts` (per category) and `city-images.ts` (per city) — both
+  generated from Wikimedia Commons and reachability-checked — and a pool that runs dry
+  throws rather than wrapping around.
+- **`catalogue:report`** asserts the catalogue's own invariants: no duplicate slug, code or
+  display name within a city, a Chinese translation, a photograph, at least two variants and
+  a plausible price band per category. It is what catches a name template that is shorter
+  than the number of listings it has to name.
+- **`check:i18n`** asserts the `en` and `zh` dictionaries have identical key sets, and
+  that every `t('…')` literal in `app/` and `components/` exists. `translate()` falls back
+  to returning the key itself, so a typo renders as literal `nav.signIn` on the page —
+  visible to a human, invisible to the compiler.
+
+### Catalogue scale
+
+Cities are sized by tier rather than uniformly: a global capital carries ~85 listings and a
+small town ~34, so a city page returns a full page of results instead of a handful.
+
+| Tier | Cities | Listings each |
+| --- | --- | --- |
+| A — global capitals | London, Paris, Rome, New York, Tokyo, Barcelona | ~81–85 |
+| B — large destinations | Edinburgh, Venice, Florence, Madrid, Amsterdam, Berlin, Lisbon, Los Angeles, San Francisco, Singapore, Sydney, Munich | ~55 |
+| C — everything else | the remaining 22 cities | ~34 |
+
+That is **~1,700 listings across 34 cities**, each with its own photograph and its own name.
+The tier table is `LISTINGS_BY_TIER` in `apps/api/prisma/seed-global.ts`; the counts are
+bounded by the image pools, so raising them means running `pnpm images:build` first.
+
+### Browser audit and end-to-end chain
+
+```bash
+pnpm ux:audit:app        # renders the storefront at 1440x900 and 393x844, fails on defects
+pnpm e2e:web             # register → verify → search → reserve → pay → ticket
+pnpm ux:audit:reference  # the same audit against expedia.com (reports, never gates)
+node scripts/ux-audit/verify-home-images.mjs  # no photo twice on the home page, both breakpoints
+```
+
+These are **not part of `pnpm verify`**: `verify` must stay deterministic and offline,
+while this suite needs a running API and web server (and, for the reference spec, the
+public internet). It checks for broken images, horizontal overflow, collapsed content and
+unnamed controls, and distinguishes a same-origin asset that failed (a defect) from a
+blocked third-party CDN (environmental). See
+[`scripts/ux-audit/README.md`](./scripts/ux-audit/README.md) — it also lists the two real
+defects this suite has already caught.
+
+`schema-audit.sh` mechanises a failure mode this codebase kept hitting: a seed
+or backfill writes a column, and no route ever reads it, so it reads like a
+feature that exists. It parses `schema.prisma`, then checks every scalar column
+against the seeds that write it and the code under `apps/api/src` that reads it.
+Foreign keys are excluded (Prisma often puts `@relation` on the following line),
+as are relation fields and array filters. The run fails if it managed to inspect
+implausibly few columns — a previous version silently checked zero and reported
+success, which is the exact bug it exists to catch.
 
 `mobile-check.sh` reads the **built** CSS at `apps/web/.next/static/css/*.css`, so run
 `pnpm --filter @easytrip/web build` first. `next dev` deletes that directory, which is why

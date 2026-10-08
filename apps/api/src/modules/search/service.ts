@@ -2,8 +2,9 @@ import { ProductStatus, ProductType, type Prisma } from '@prisma/client';
 import { config } from '../../config/env';
 import { logger } from '../../lib/logger';
 import { prisma } from '../../lib/prisma';
+import { liveRates } from '../supply/live-adapters';
+import { LIVE_CATEGORY_BY_PRODUCT_TYPE, type LivePriceInfo } from '../supply/live';
 import { eachDay, formatServiceDate, toServiceDate } from '../../utils/date';
-import { AppError } from '../../utils/errors';
 
 /**
  * ---------------------------------------------------------------------------
@@ -36,6 +37,19 @@ export type SearchParams = {
   instantConfirmOnly?: boolean;
   freeCancellationOnly?: boolean;
   skipTheLineOnly?: boolean;
+  /**
+   * Phase 0 category facets. Each one is meaningful for a single category and
+   * simply yields no matches elsewhere, so they do not need to be namespaced by
+   * category — `starRating=5&type=HOTEL_ROOM` is the intended usage, and
+   * `starRating=5&type=FLIGHT` correctly returns nothing rather than silently
+   * dropping the filter.
+   */
+  starRatingIn?: number[];
+  carrierCodeIn?: string[];
+  carrierNameIn?: string[];
+  shipNameIn?: string[];
+  destinationPortIn?: string[];
+  boardBasisIn?: string[];
   languages?: string[];
   tags?: string[];
   latitude?: number;
@@ -114,8 +128,42 @@ export type SearchHit = {
   longitude: number | null;
   distanceKm: number | null;
   nextAvailableDate: string | null;
-  badge: string | null;
+  /**
+   * Present only when a live source priced this hit, and the price shown is that
+   * source's net cost. Absent means the seeded `TicketType.basePriceCents` stands,
+   * which is the normal case — the storefront renders it either way.
+   */
+  live: LivePriceInfo | null;
+  /**
+   * A highlight worth surfacing on the card, as a **code, not copy**.
+   *
+   * It used to send the display string (`'Priority entry'`), which meant the API
+   * owned UI text and — because the storefront is bilingual — shipped English
+   * words onto otherwise Chinese cards. A code keeps the two concerns apart: the
+   * API decides *what* is true about a product, the web layer decides how to say
+   * it. See `search.badgePRIORITY_ENTRY` and friends in the dictionaries.
+   */
+  badgeCode: SearchBadgeCode | null;
   tags: string[];
+
+  /**
+   * Category facets, carried straight from `SearchDocument`.
+   *
+   * These are the Phase 0 additions: a hotel can be filtered by official stars
+   * and board basis, a flight by carrier and route, a cruise by ship. They stay
+   * flat and nullable here because the storefront renders a card per category —
+   * a `HotelCard` needs `starRating`, a `FlightCard` needs `routeSummary`, and
+   * neither should have to know the other's field exists. The structured form
+   * lives in the `ProductStay` / `ProductFlight` / `ProductSailing` tables and
+   * is served by the product endpoint, not the search list.
+   */
+  starRating: number | null;
+  boardBasis: string | null;
+  carrierCode: string | null;
+  carrierName: string | null;
+  routeSummary: string | null;
+  shipName: string | null;
+  destinationPort: string | null;
 
   /**
    * Category-specific display fields, mirrored from `Product`.
@@ -162,15 +210,99 @@ function emptyFacets(): Facets {
  * Resolves the cheapest sellable price per product for the requested dates.
  * Products with no availability on any requested date are dropped entirely -
  * this is what makes search results bookable rather than merely attractive.
+ *
+ * Returns the live metadata alongside the prices rather than mutating silently:
+ * a shopper whose price moved needs to be able to see that an upstream moved it,
+ * and support needs to know which source to ask.
  */
+/**
+ * Sellable units per ticket type, summed by the database.
+ *
+ * **The aggregate is the whole point of this function.** The obvious
+ * implementation — fetch each ticket type with its `InventoryRecord` rows
+ * nested and reduce them in Node — loads one object per row. At 5,133 ticket
+ * types and a 120-day window that is roughly 200,000 rows per search, and a
+ * single unfiltered request was measured growing the API's RSS by **707 MB**
+ * (122 MB → 829 MB in 5.7 s). `pnpm verify` runs search hundreds of times, so
+ * the container ran out of memory and the API was killed mid-suite.
+ *
+ * Postgres can add those numbers up without shipping them: `groupBy` returns
+ * one row per ticket type, so the memory cost is proportional to the number of
+ * *listings*, not to the number of inventory rows. Only three numbers are ever
+ * needed — capacity, held, sold — and none of them needs its rows in Node.
+ *
+ * `rows` is returned alongside because `UNLIMITED` inventory counts 1,000 units
+ * *per row*, which is a row count rather than a capacity sum.
+ */
+async function sumSellableUnits(
+  ticketTypes: { id: string; inventoryMode: InventoryMode }[],
+  dates: Date[],
+): Promise<Map<string, { sellable: number; rows: number }>> {
+  const totals = new Map<string, { sellable: number; rows: number }>();
+  if (ticketTypes.length === 0) return totals;
+
+  const ids = ticketTypes.map((t) => t.id);
+  const modeById = new Map(ticketTypes.map((t) => [t.id, t.inventoryMode]));
+  const now = new Date();
+
+  // Postgres caps a statement at 65,535 bind parameters; one id per chunk keeps
+  // this far below it and bounds the result set as the catalogue grows.
+  const CHUNK = 1000;
+  for (let offset = 0; offset < ids.length; offset += CHUNK) {
+    const rows = await prisma.inventoryRecord.groupBy({
+      by: ['ticketTypeId'],
+      where: {
+        ticketTypeId: { in: ids.slice(offset, offset + CHUNK) },
+        // A closed or sold-out record contributes nothing, so it is excluded
+        // rather than fetched and skipped — the same arithmetic, less data.
+        status: { notIn: ['CLOSED', 'SOLD_OUT'] },
+        serviceDate: dates.length ? { in: dates } : { gte: now },
+      },
+      _sum: { capacityTotal: true, capacityHeld: true, capacitySold: true },
+      _count: { _all: true },
+    });
+
+    for (const row of rows) {
+      const capacity = row._sum.capacityTotal ?? 0;
+      const held = row._sum.capacityHeld ?? 0;
+      const sold = row._sum.capacitySold ?? 0;
+      const count = row._count?._all ?? 0;
+      const sellable = modeById.get(row.ticketTypeId) === 'UNLIMITED' ? count * 1_000 : Math.max(0, capacity - held - sold);
+      totals.set(row.ticketTypeId, { sellable, rows: count });
+    }
+  }
+
+  // A ticket type with no sellable records at all is absent from `groupBy`,
+  // which reads as zero. Stating it explicitly keeps the availability gate
+  // below a simple lookup rather than a "missing means zero" convention.
+  for (const id of ids) {
+    if (!totals.has(id)) totals.set(id, { sellable: 0, rows: 0 });
+  }
+
+  return totals;
+}
+
 async function resolveAvailabilityAndPrice(
   productIds: string[],
   dates: Date[],
   requestedDates?: string[],
-): Promise<Map<string, { minPriceCents: number; compareAtCents: number | null; nextDate: string | null; availableQty: number }>> {
+): Promise<{
+  prices: Map<string, { minPriceCents: number; compareAtCents: number | null; nextDate: string | null; availableQty: number }>;
+  livePrices: Map<string, LivePriceInfo>;
+}> {
   const result = new Map<string, { minPriceCents: number; compareAtCents: number | null; nextDate: string | null; availableQty: number }>();
-  if (productIds.length === 0) return result;
+  if (productIds.length === 0) return { prices: result, livePrices: new Map() };
 
+  // Bundles carry no inventory of their own, so they must bypass the
+  // availability gate below and be resolved from their components instead.
+  const bundleRows = await prisma.productBundle.findMany({
+    where: { productId: { in: productIds } },
+    select: { productId: true },
+  });
+  const bundleProductIds = new Set(bundleRows.map((b) => b.productId));
+
+  // Ticket types carry only what pricing and the availability gate need. The
+  // inventory is deliberately *absent* here — see `sumSellableUnits`.
   const ticketTypes = await prisma.ticketType.findMany({
     where: { productId: { in: productIds }, active: true },
     select: {
@@ -179,22 +311,21 @@ async function resolveAvailabilityAndPrice(
       basePriceCents: true,
       compareAtCents: true,
       inventoryMode: true,
-      inventory: dates.length
-        ? { where: { serviceDate: { in: dates } }, select: { capacityTotal: true, capacityHeld: true, capacitySold: true, status: true } }
-        : { where: { serviceDate: { gte: new Date() } }, select: { capacityTotal: true, capacityHeld: true, capacitySold: true, status: true }, take: 40 },
     },
   });
 
+  const units = await sumSellableUnits(ticketTypes, dates);
+
   for (const ticketType of ticketTypes) {
-    const available = ticketType.inventory.reduce((total, record) => {
-      if (record.status === 'CLOSED' || record.status === 'SOLD_OUT') return total;
-      if (ticketType.inventoryMode === 'UNLIMITED') return total + 1_000;
-      return total + Math.max(0, record.capacityTotal - record.capacityHeld - record.capacitySold);
-    }, 0);
+    const available = units.get(ticketType.id)?.sellable ?? 0;
 
     // With explicit dates we require availability on *at least one* of them;
     // this keeps multi-date browsing useful while never showing dead ends.
-    if (available <= 0) continue;
+    // A bundle is exempt: it never holds stock itself, and its availability is
+    // resolved from its components in `addBundleAvailability`. Gating it here
+    // would drop every package from search.
+    const isBundle = bundleProductIds.has(ticketType.productId);
+    if (available <= 0 && !isBundle) continue;
 
     const existing = result.get(ticketType.productId);
     if (!existing || ticketType.basePriceCents < existing.minPriceCents) {
@@ -207,7 +338,208 @@ async function resolveAvailabilityAndPrice(
     }
   }
 
-  return result;
+  await addBundleAvailability(result, bundleProductIds, dates, requestedDates);
+
+  const livePrices = await applyLiveRates(result, ticketTypes);
+
+  return { prices: result, livePrices };
+}
+
+/**
+ * Overlays live upstream net rates onto the resolved search prices.
+ *
+ * Ordering matters and is the whole point of this function:
+ *
+ *   1. **Availability is decided before this runs.** `InventoryRecord` above is
+ *      the only authority on whether anything is sellable. No live source in the
+ *      chain reports a trustworthy allotment, and one that did would be advisory
+ *      anyway — a source can prove "sold out", never "in stock".
+ *   2. **A live price only ever replaces the number a live quote returned.** A
+ *      `null` quote (no source configured, or all sources down) leaves the
+ *      seeded `basePriceCents` untouched, so search behaves exactly as it did
+ *      before this layer existed.
+ *   3. **The value stored is a cost, not a retail price.** `minPriceCents` is
+ *      compared against `TicketType.basePriceCents` upstream, which is itself a
+ *      pre-markup cost, so substituting a net rate here keeps the comparison
+ *      like-for-like. Platform markup, tax and fee are applied later by
+ *      `computeQuote`, exactly as for a seeded price.
+ *
+ * Failure is absorbed rather than propagated: a live layer that throws would
+ * otherwise take the whole search endpoint down, which is a far worse outcome
+ * than quoting a slightly stale number.
+ */
+/**
+ * Applies live upstream net rates onto the resolved search prices, and returns
+ * what it did per product so `SearchHit.live` can report it.
+ *
+ * Ordering matters and is the whole point of this function:
+ *
+ *   1. **Availability is decided before this runs.** `InventoryRecord` above is
+ *      the only authority on whether anything is sellable. No live source in the
+ *      chain reports a trustworthy allotment, and one that did would be advisory
+ *      anyway — a source can prove "sold out", never "in stock".
+ *   2. **A live price only ever replaces the number a live quote returned.** A
+ *      `null` quote (no source configured, or all sources down) leaves the
+ *      seeded `basePriceCents` untouched, so search behaves exactly as it did
+ *      before this layer existed.
+ *   3. **The value stored is a cost, not a retail price.** `minPriceCents` is
+ *      compared against `TicketType.basePriceCents` upstream, which is itself a
+ *      pre-markup cost, so substituting a net rate here keeps the comparison
+ *      like-for-like. Platform markup, tax and fee are applied later by
+ *      `computeQuote`, exactly as for a seeded price.
+ *
+ * Failure is absorbed rather than propagated: a live layer that throws would
+ * otherwise take the whole search endpoint down, which is a far worse outcome
+ * than quoting a slightly stale number.
+ */
+async function applyLiveRates(
+  prices: Map<string, { minPriceCents: number; compareAtCents: number | null; nextDate: string | null; availableQty: number }>,
+  ticketTypes: { id: string; productId: string }[],
+): Promise<Map<string, LivePriceInfo>> {
+  const applied = new Map<string, LivePriceInfo>();
+  if (!liveRates.enabled || prices.size === 0) return applied;
+
+  // One live lookup per product, not per ticket type: the upstream answers per
+  // product/date, and asking twice for the same row is how rate limits and
+  // inconsistent prices between variants of one product are introduced.
+  const productById = new Map<string, string>();
+  for (const ticketType of ticketTypes) {
+    if (!productById.has(ticketType.productId)) productById.set(ticketType.productId, ticketType.id);
+  }
+
+  const settled = await Promise.all(
+    [...prices.keys()].map(async (productId) => {
+      const entry = prices.get(productId);
+      const ticketTypeId = productById.get(productId);
+      if (!entry || !ticketTypeId) return null;
+
+      // Slug and currency are both required by `LiveRateQuery`, and neither can
+      // be invented here — so they are read from the product and its ticket
+      // type rather than guessed. This costs one indexed lookup per product,
+      // which the search index already does for the same row.
+      const product = await prisma.product.findUnique({
+        where: { id: productId },
+        select: { slug: true, type: true },
+      });
+      if (!product) return null;
+
+      const currency = await prisma.ticketType.findUnique({
+        where: { id: ticketTypeId },
+        select: { currency: true },
+      });
+      if (!currency) return null;
+
+      const category = LIVE_CATEGORY_BY_PRODUCT_TYPE[product.type];
+      if (!category) return null;
+
+      const result = await liveRates.resolve(
+        {
+          slug: product.slug,
+          category,
+          serviceDate: entry.nextDate ?? new Date().toISOString().slice(0, 10),
+          quantity: 1,
+          currency: currency.currency,
+        },
+        'search',
+      );
+
+      // `quote === null` means "no source answered", not "unavailable" — leave
+      // the seeded price alone. `degraded` is surfaced on the hit for support.
+      return result.quote
+        ? {
+            productId,
+            netPriceCents: result.quote.netPriceCents,
+            currency: result.quote.currency,
+            sourceId: result.quote.sourceId,
+            degraded: result.degraded,
+          }
+        : null;
+    }),
+  );
+
+  for (const outcome of settled) {
+    if (!outcome) continue;
+    const entry = prices.get(outcome.productId);
+    if (!entry) continue;
+    entry.minPriceCents = outcome.netPriceCents;
+    applied.set(outcome.productId, {
+      netPriceCents: outcome.netPriceCents,
+      currency: outcome.currency,
+      sourceId: outcome.sourceId,
+      degraded: outcome.degraded,
+    });
+  }
+  return applied;
+}
+
+/**
+ * Only the three categories the live layer carries. Attractions and everything
+ * else keep their seeded price, because no source in the chain prices them and
+ * guessing would be worse than not answering. See
+ * `LIVE_CATEGORY_BY_PRODUCT_TYPE` in `modules/supply/live.ts`, which is shared
+ * with the product detail route so both resolve a category the same way.
+ */
+
+/**
+ * Folds component availability up into each bundle.
+ *
+ * A bundle holds no inventory of its own — its `TicketType` exists only as a
+ * booking entry point, and what is actually sold is its components. Left
+ * unhandled, every package is dropped by the "no availability" rule above and
+ * silently disappears from search, which is how a seeded package can exist in
+ * the database and return zero results.
+ *
+ * A package is bookable when every **required** component has stock. Optional
+ * components are skipped on expansion if they are sold out, so letting one gate
+ * the package would hide trips that are still perfectly bookable.
+ */
+async function addBundleAvailability(
+  result: Map<string, { minPriceCents: number; compareAtCents: number | null; nextDate: string | null; availableQty: number }>,
+  bundleProductIds: Set<string>,
+  dates: Date[],
+  requestedDates?: string[],
+): Promise<void> {
+  if (bundleProductIds.size === 0) return;
+
+  const bundles = await prisma.productBundle.findMany({
+    where: { productId: { in: [...bundleProductIds] } },
+    include: { components: true },
+  });
+  if (bundles.length === 0) return;
+
+  const componentIds = bundles.flatMap((b) => b.components.map((c) => c.ticketTypeId));
+  if (componentIds.length === 0) return;
+
+  const componentTypes = await prisma.ticketType.findMany({
+    where: { id: { in: componentIds }, active: true },
+    select: { id: true, inventoryMode: true },
+  });
+
+  // Same aggregate as the main path — a bundle's components have their own
+  // inventory, and loading their rows would reintroduce the memory blow-up
+  // `sumSellableUnits` exists to avoid.
+  const unitsById = await sumSellableUnits(componentTypes, dates);
+
+  for (const bundle of bundles) {
+    const own = result.get(bundle.productId);
+    if (!own) continue;
+
+    const unitsFor = (ticketTypeId: string): number => unitsById.get(ticketTypeId)?.sellable ?? 0;
+
+    // Required components gate the package; optional ones only widen it.
+    const required = bundle.components.filter((c) => c.required);
+    const gating = required.length > 0 ? required : bundle.components;
+    const leastAvailable = gating.map((c) => unitsFor(c.ticketTypeId)).sort((a, b) => a - b)[0] ?? 0;
+    if (leastAvailable <= 0) continue;
+
+    result.set(bundle.productId, {
+      ...own,
+      // A trip of several bookings can be sold to fewer travellers than any one
+      // component allows on its own.
+      availableQty: Math.min(leastAvailable, own.availableQty || leastAvailable),
+      nextDate: own.nextDate ?? requestedDates?.[0] ?? null,
+    });
+  }
 }
 
 function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
@@ -220,8 +552,26 @@ function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): nu
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-/** Rows pulled from Postgres before availability/price resolution. */
-const CANDIDATE_LIMIT = 400;
+/**
+ * Rows pulled from Postgres before availability/price resolution.
+ *
+ * This is a **hard cap on how many results search can ever report**, because
+ * `total` is `Math.min(count, hits.length)` after the availability gate drops
+ * anything unbookable. Set below the catalogue size it does not merely slow
+ * things down — it silently deletes the tail. At 400 against a 468-product
+ * catalogue the last 70 listings stopped appearing in *any* search, including a
+ * plain unfiltered one, with no error anywhere. It is the same failure the
+ * `/destinations` endpoint had when a `take` hid Sydney and Melbourne.
+ *
+ * The cap exists because each candidate costs an inventory join (one
+ * `TicketType` fetch with nested `InventoryRecord`s) and a price resolution, so
+ * it is not free to remove. It is instead set well above the catalogue and
+ * guarded: if the count ever exceeds it, the request logs
+ * `search.candidates_truncated` so the next person finds a warning rather than a
+ * mystery. Grow the catalogue by an order of magnitude and this is the line to
+ * revisit.
+ */
+const CANDIDATE_LIMIT = 5000;
 
 /** Ranking window shared by the flat list, the category buckets and the facets. */
 function candidateOrderBy(sort: SortOption | undefined): Prisma.SearchDocumentOrderByWithRelationInput | undefined {
@@ -305,6 +655,12 @@ async function searchPostgres(params: SearchParams): Promise<SearchResult> {
   if (params.instantConfirmOnly) whereBase.instantConfirm = true;
   if (params.freeCancellationOnly) whereBase.freeCancellation = true;
   if (params.skipTheLineOnly) whereBase.skipTheLine = true;
+  if (params.starRatingIn?.length) whereBase.starRating = { in: params.starRatingIn };
+  if (params.carrierCodeIn?.length) whereBase.carrierCode = { in: params.carrierCodeIn };
+  if (params.carrierNameIn?.length) whereBase.carrierName = { in: params.carrierNameIn };
+  if (params.shipNameIn?.length) whereBase.shipName = { in: params.shipNameIn };
+  if (params.destinationPortIn?.length) whereBase.destinationPort = { in: params.destinationPortIn };
+  if (params.boardBasisIn?.length) whereBase.boardBasis = { in: params.boardBasisIn };
   if (params.tags?.length) whereBase.tags = { hasSome: params.tags.map((t) => t.toLowerCase()) };
 
   if (andFilters.length > 0) whereBase.AND = andFilters;
@@ -316,13 +672,24 @@ async function searchPostgres(params: SearchParams): Promise<SearchResult> {
 
   const total = await prisma.searchDocument.count({ where });
 
+  // Truncation used to be invisible: the cap silently removed listings from
+  // every result page, including an unfiltered one, and the only symptom was a
+  // result count that quietly stopped growing. Say it out loud instead.
+  if (total > CANDIDATE_LIMIT) {
+    logger.warn('search.candidates_truncated', {
+      matching: total,
+      candidateLimit: CANDIDATE_LIMIT,
+      note: 'raise CANDIDATE_LIMIT — the tail of these results is not being shown',
+    });
+  }
+
   const candidates = await prisma.searchDocument.findMany({
     where,
     take: CANDIDATE_LIMIT,
     orderBy: candidateOrderBy(params.sort),
   });
 
-  const prices = await resolveAvailabilityAndPrice(
+  const { prices, livePrices } = await resolveAvailabilityAndPrice(
     candidates.map((c) => c.productId),
     dates,
     requestedDates,
@@ -359,8 +726,20 @@ async function searchPostgres(params: SearchParams): Promise<SearchResult> {
         longitude: doc.longitude,
         distanceKm: distance,
         nextAvailableDate: price.nextDate,
-        badge: null,
+        // Keyed by productId, which is what `resolveAvailabilityAndPrice`
+        // populates. Reading `doc.id` here (the SearchDocument primary key) is
+        // always a miss, so every Postgres-backed hit silently reported
+        // `live: null` even when a source had answered.
+        live: livePrices.get(doc.productId) ?? null,
+        badgeCode: null,
         tags: doc.tags,
+        starRating: doc.starRating ?? null,
+        boardBasis: doc.boardBasis ?? null,
+        carrierCode: doc.carrierCode ?? null,
+        carrierName: doc.carrierName ?? null,
+        routeSummary: doc.routeSummary ?? null,
+        shipName: doc.shipName ?? null,
+        destinationPort: doc.destinationPort ?? null,
       };
     });
 
@@ -466,10 +845,10 @@ async function hydrateHits(hits: SearchHit[], locale = 'en'): Promise<SearchHit[
       title: translation?.name ?? product.slug,
       summary: translation?.summary ?? hit.summary,
       imageUrl: product.media[0]?.url ?? null,
-      // Positive, trust-building badge only. A discount percentage is
+      // Positive, trust-building signal only. A discount percentage is
       // deliberately not used here: the storefront reads as a premium
       // consultancy, not a bargain bin.
-      badge: badgeFor(hit.type, product),
+      badgeCode: badgeCodeFor(product),
       tags: product.tags.map((t) => t.slug),
       category: {
         airlineName: product.airlineName,
@@ -490,13 +869,23 @@ async function hydrateHits(hits: SearchHit[], locale = 'en'): Promise<SearchHit[
 }
 
 /**
- * The small ribbon on a card. Ranked from most to least differentiating so a
- * product always gets the strongest honest signal it has.
+ * The small highlight a card may carry. Ranked from most to least
+ * differentiating, so a product always gets the strongest honest signal it has.
+ *
+ * Deliberately a closed union rather than a free string: it is a value the web
+ * layer translates, so an open string would just reintroduce untranslatable
+ * copy into the API.
  */
-function badgeFor(type: string, product: { skipTheLine: boolean; instantConfirm: boolean; privateDeparture: boolean }): string | null {
-  if (product.skipTheLine) return 'Priority entry';
-  if (product.privateDeparture) return 'Private departure';
-  if (product.instantConfirm) return 'Instant confirmation';
+export type SearchBadgeCode = 'PRIORITY_ENTRY' | 'PRIVATE_DEPARTURE' | 'INSTANT_CONFIRMATION';
+
+function badgeCodeFor(product: {
+  skipTheLine: boolean;
+  instantConfirm: boolean;
+  privateDeparture: boolean;
+}): SearchBadgeCode | null {
+  if (product.skipTheLine) return 'PRIORITY_ENTRY';
+  if (product.privateDeparture) return 'PRIVATE_DEPARTURE';
+  if (product.instantConfirm) return 'INSTANT_CONFIRMATION';
   return null;
 }
 
@@ -644,6 +1033,12 @@ async function searchOpenSearch(params: SearchParams): Promise<SearchResult> {
   if (params.instantConfirmOnly) facetFilter.push({ term: { instantConfirm: true } });
   if (params.freeCancellationOnly) facetFilter.push({ term: { freeCancellation: true } });
   if (params.skipTheLineOnly) facetFilter.push({ term: { skipTheLine: true } });
+  if (params.starRatingIn?.length) facetFilter.push({ terms: { starRating: params.starRatingIn } });
+  if (params.carrierCodeIn?.length) facetFilter.push({ terms: { carrierCode: params.carrierCodeIn } });
+  if (params.carrierNameIn?.length) facetFilter.push({ terms: { carrierName: params.carrierNameIn } });
+  if (params.shipNameIn?.length) facetFilter.push({ terms: { shipName: params.shipNameIn } });
+  if (params.destinationPortIn?.length) facetFilter.push({ terms: { destinationPort: params.destinationPortIn } });
+  if (params.boardBasisIn?.length) facetFilter.push({ terms: { boardBasis: params.boardBasisIn } });
   if (params.minPriceCents !== undefined) facetFilter.push({ range: { basePriceCents: { gte: params.minPriceCents } } });
   if (params.maxPriceCents !== undefined) facetFilter.push({ range: { basePriceCents: { lte: params.maxPriceCents } } });
 
@@ -727,7 +1122,7 @@ async function searchOpenSearch(params: SearchParams): Promise<SearchResult> {
     const dates = requestedDates?.map((d) => toServiceDate(d)) ?? [];
     const rawHits = data.hits.hits.map((h) => h._source as Record<string, unknown>);
 
-    const prices = await resolveAvailabilityAndPrice(
+    const { prices, livePrices } = await resolveAvailabilityAndPrice(
       rawHits.map((h) => h.productId as string),
       dates,
       requestedDates,
@@ -765,8 +1160,16 @@ async function searchOpenSearch(params: SearchParams): Promise<SearchResult> {
           longitude: (h.longitude as number) ?? null,
           distanceKm: distance,
           nextAvailableDate: price.nextDate,
-          badge: null,
+          live: livePrices.get(h.productId as string) ?? null,
+          badgeCode: null,
           tags: (h.tags as string[]) ?? [],
+          starRating: (h.starRating as number) ?? null,
+          boardBasis: (h.boardBasis as string) ?? null,
+          carrierCode: (h.carrierCode as string) ?? null,
+          carrierName: (h.carrierName as string) ?? null,
+          routeSummary: (h.routeSummary as string) ?? null,
+          shipName: (h.shipName as string) ?? null,
+          destinationPort: (h.destinationPort as string) ?? null,
         };
       });
 
@@ -832,11 +1235,16 @@ export async function indexProduct(productId: string): Promise<void> {
 
   const defaultTranslation = product.translations.find((t) => t.locale === product.defaultLocale) ?? product.translations[0];
 
-  // Every locale's copy goes into `body` and `keywords`, not just the default.
-  // The Postgres matcher scans `body`/`title`/`keywords`, so a Chinese shopper
-  // searching 「私人向导」 must hit a product whose only English word is
-  // "guide" — that only works if the translated names, summaries and
-  // highlights are indexed alongside the English ones.
+  // Every locale's copy goes into `body` — not just the default.
+  //
+  // The Postgres matcher scans `title`/`body`/`keywords`, so a Chinese shopper
+  // searching 「私享向导」 must hit a product whose only English word is
+  // "guide". That works because `body` is matched as a *substring*
+  // (`contains`), so a contiguous query matches a contiguous field regardless of
+  // language — no tokeniser is involved. FTS cannot do this here: measured on
+  // this catalogue, `to_tsvector('simple', '伦敦私享向导一日')` yields the single
+  // lexeme `'伦敦私享向导一日':1`, i.e. Chinese is not segmentable at all without
+  // zhparser. See docs/search-index-design.md.
   const localizedCopy = product.translations.flatMap((t) => [
     t.name,
     t.summary ?? '',
@@ -873,7 +1281,22 @@ export async function indexProduct(productId: string): Promise<void> {
     titleAll: product.translations.map((t) => t.name),
     summary: defaultTranslation?.summary ?? null,
     body,
-    keywords: [...product.tags.map((t) => t.label), ...localizedCopy]
+    // `keywords` holds **tokens**, not prose.
+    //
+    // The Postgres matcher tests this field with `has`, which is an exact
+    // array-element comparison. Seeding it with whole sentences (`localizedCopy`
+    // contains full titles, summaries and highlight paragraphs) meant those
+    // entries could only ever be hit by a shopper typing the sentence verbatim —
+    // and the same content was already reachable through `body`, which is
+    // substring-matched. So the array was simultaneously useless and, because
+    // the two fields match differently, a source of "why did *that* not match"
+    // behaviour that cannot be explained to a user.
+    //
+    // Tags stay: a tag label is a genuine token (`five-star`,
+    // `breakfast-included`), lives in no other indexed field, and is exactly
+    // what exact matching is for. The prose is in `body`, unaltered.
+    keywords: product.tags
+      .map((t) => t.label)
       .filter(Boolean)
       .map((k) => String(k).toLowerCase()),
     tags: product.tags.map((t) => t.slug),

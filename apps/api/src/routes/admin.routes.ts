@@ -6,7 +6,7 @@ import { requireRole } from '../plugins/auth';
 import { indexProduct, reindexAll } from '../modules/search/service';
 import { seedInventoryWindow } from '../modules/inventory/engine';
 import { computeQuote } from '../modules/pricing/engine';
-import { AppError, assertFound } from '../utils/errors';
+import { assertFound } from '../utils/errors';
 import { addDays, toServiceDate } from '../utils/date';
 import { hashPassword } from '../utils/crypto';
 
@@ -16,7 +16,7 @@ import { hashPassword } from '../utils/crypto';
  * catalogue, inventory, orders, finance and gate operations.
  */
 export async function adminRoutes(app: FastifyInstance): Promise<void> {
-  const staff = { preHandler: [requireRole('OPERATOR', 'ADMIN', 'MERCHANT')] };
+  const staff = { preHandler: [requireRole('ADMIN')] };
   const adminOnly = { preHandler: [requireRole('ADMIN')] };
 
   // -------------------------------------------------------------------------

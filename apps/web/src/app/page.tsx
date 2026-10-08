@@ -3,7 +3,8 @@ import { api } from '@/lib/api';
 import { formatMoney } from '@/lib/format';
 import { ProductCard } from '@/components/ProductCard';
 import { PromoStrip } from '@/components/PromoStrip';
-import { resolveServerLocale } from '@/lib/i18n/config';
+import { SafeImage } from '@/components/SafeImage';
+import { resolveServerLocale, htmlLang } from '@/lib/i18n/config';
 import { createTranslator } from '@/lib/i18n/dictionaries';
 import { brandName, brandTagline } from '@/lib/brand';
 import type { LocaleCode } from '@/lib/i18n/config';
@@ -26,6 +27,32 @@ export default async function HomePage() {
     api.collection('skip-the-line', null, locale).catch(() => null),
     api.collection('top-rated', null, locale).catch(() => null),
   ]);
+
+  /**
+   * No product is shown twice on the home page.
+   *
+   * The four rails are independent queries — `trending` sorts by popularity,
+   * `top-rated` by rating, and the other two by nothing in particular — so they
+   * overlap freely. One product came first in all four, which put its
+   * photograph on the page four times and made a merchandised home page read as
+   * a template loop. The rails are ordered deliberately, so the first rail that
+   * claims a product keeps it and later rails skip it.
+   *
+   * `take` is applied here rather than left to the rail's own `slice`, so a
+   * product that will not actually be displayed is not reserved against the
+   * rails below it — otherwise one rail's hidden surplus could empty the next.
+   */
+  const shown = new Set<string>();
+  const claim = <T extends { productId: string }>(items: T[], take: number): T[] => {
+    const out: T[] = [];
+    for (const item of items) {
+      if (out.length >= take) break;
+      if (shown.has(item.productId)) continue;
+      shown.add(item.productId);
+      out.push(item);
+    }
+    return out;
+  };
 
   return (
     <>
@@ -82,7 +109,7 @@ export default async function HomePage() {
               <div>
                 <h2>{t('home.destinations')}</h2>
                 <p className="small muted" style={{ margin: 0 }}>
-                  {t('home.heroSubtitle')}
+                  {t('home.destinationsSubtitle')}
                 </p>
               </div>
               <Link href="/search" className="btn btn-ghost btn-sm">
@@ -98,11 +125,18 @@ export default async function HomePage() {
                   className="destination-tile"
                 >
                   <div className="destination-media">
-                    {destination.heroImageUrl ? (
-                      <img src={destination.heroImageUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} loading="lazy" />
-                    ) : (
-                      <div className="skeleton" style={{ width: '100%', height: '100%' }} />
-                    )}
+                    <SafeImage
+                      src={destination.heroImageUrl}
+                      alt={destination.name}
+                      style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                      fallback={
+                        // No image (or it failed): the tile keeps a dark base so
+                        // the white caption stays legible instead of sitting on grey.
+                        <div className="destination-fallback" aria-hidden>
+                          <span>{destination.name.slice(0, 1)}</span>
+                        </div>
+                      }
+                    />
                     <div className="destination-scrim" />
                     <div className="destination-caption">
                       <div className="destination-name">{destination.name}</div>
@@ -122,7 +156,7 @@ export default async function HomePage() {
           <Rail
             title={trending.title}
             subtitle={t('home.trendingSubtitle')}
-            hits={trending.items}
+            hits={claim(trending.items, 5)}
             locale={locale}
           />
         )}
@@ -137,7 +171,7 @@ export default async function HomePage() {
                 title={t('home.freeCancel')}
                 subtitle={t('home.freeCancelSubtitle')}
                 href="/collections/free-cancellation"
-                hits={freeCancel.items.slice(0, 3)}
+                hits={claim(freeCancel.items, 3)}
                 tone="success"
                 locale={locale}
               />
@@ -147,7 +181,7 @@ export default async function HomePage() {
                 title={t('home.skipTheLine')}
                 subtitle={t('home.skipLineSubtitle')}
                 href="/collections/skip-the-line"
-                hits={skipLine.items.slice(0, 3)}
+                hits={claim(skipLine.items, 3)}
                 tone="brand"
                 locale={locale}
               />
@@ -162,7 +196,7 @@ export default async function HomePage() {
           <Rail
             title={t('home.favourites')}
             subtitle={t('home.favouritesSubtitle')}
-            hits={topRated.items}
+            hits={claim(topRated.items, 5)}
             locale={locale}
           />
         )}
@@ -242,6 +276,9 @@ function SearchBox({ locale }: { locale: LocaleCode }) {
           name="date"
           type="date"
           className="input"
+          // Without this the native control renders its format placeholder in
+          // the *browser's* locale, so an English page shows `年月日`.
+          lang={htmlLang(locale)}
           style={{ border: 'none', padding: '4px 0', fontSize: 16 }}
         />
       </div>
@@ -336,11 +373,11 @@ function CollectionCard({
             }}
           >
             {hit.imageUrl && (
-              <img
+              <SafeImage
                 src={hit.imageUrl}
                 alt=""
                 style={{ width: 46, height: 46, borderRadius: 8, objectFit: 'cover', flexShrink: 0 }}
-                loading="lazy"
+                fallback={<div className="img-fallback img-fallback-sm" aria-hidden />}
               />
             )}
             <div className="grow" style={{ minWidth: 0 }}>
