@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import type { SearchHit } from '@/lib/api';
+import { SafeImage } from '@/components/SafeImage';
 import { formatMoney, stars } from '@/lib/format';
 import type { LocaleCode } from '@/lib/i18n/config';
 import { createTranslator } from '@/lib/i18n/dictionaries';
@@ -62,14 +63,36 @@ function pick(meta: { en: string; zh: string } | undefined, locale: LocaleCode):
  * own content: a flight leads with the route, a hotel with its star rating, a
  * cruise with the ship and its length in nights.
  */
+/**
+ * True when a route names an intermediate airport.
+ *
+ * The separator is matched loosely (`→`, `->`, `➜`) because the seeds write it
+ * and a supplier feed may write another; what matters is counting airports, not
+ * matching one glyph. A two-airport route is a direct hop by definition.
+ */
+function hasStop(route: string): boolean {
+  return route.split(/\s*(?:→|->|➜)\s*/).filter(Boolean).length > 2;
+}
+
 function categoryFacts(hit: SearchHit, locale: LocaleCode): string[] {
   const zh = locale === 'zh';
   const c = hit.category;
   if (!c) return [];
 
   switch (hit.type) {
-    case 'FLIGHT':
-      return [c.flightRoute, c.airlineName, c.cabinClass].filter((v): v is string => Boolean(v));
+    case 'FLIGHT': {
+      const facts: string[] = [];
+      // Say so when the journey stops. A route written "SIN → DXB → JFK" is a
+      // one-stop itinerary, and a traveller reading only the airports would
+      // otherwise assume it is direct — which changes both the total travel
+      // time and the connection risk they are buying.
+      if (c.flightRoute && hasStop(c.flightRoute)) {
+        facts.push(zh ? '经停' : '1 stop');
+      }
+      return [...facts, c.flightRoute, c.airlineName, c.cabinClass].filter(
+        (v): v is string => Boolean(v),
+      );
+    }
 
     case 'HOTEL_ROOM':
       return [
@@ -115,23 +138,29 @@ export function ProductCard({ hit, locale }: { hit: SearchHit; locale: LocaleCod
     assurances.push(t('search.instantConfirm'));
   }
 
+  // The highlight comes from the same flags as the assurances, so the two can
+  // say the same thing — "Priority entry" was rendered twice on one card. The
+  // highlight is the lead chip; filter its exact text out of the rest, which
+  // keeps working whatever string either side maps to.
+  const highlight = hit.badgeCode ? t(`search.badge${hit.badgeCode}`) : null;
+  const chips = highlight ? assurances.filter((text) => text !== highlight) : assurances;
+
   return (
     <article className="product-card">
       <Link href={`/products/${hit.slug}`} className="product-media" aria-hidden tabIndex={-1}>
-        {hit.imageUrl ? (
-          // Plain <img> keeps the build dependency-free; Next's image optimiser
-          // would need every partner CDN allow-listed.
-          <img src={hit.imageUrl} alt="" loading="lazy" />
-        ) : (
-          <div className="product-media-fallback" aria-hidden>
-            ✦
-          </div>
-        )}
-        {hit.badge && (
-          <span className="product-ribbon" style={{ boxShadow: 'var(--shadow-sm)' }}>
-            {hit.badge}
-          </span>
-        )}
+        <SafeImage
+          src={hit.imageUrl}
+          alt=""
+          fallback={
+            <div className="product-media-fallback" aria-hidden>
+              ✦
+            </div>
+          }
+        />
+        {/* No ribbon over the photo. A white label on a 96x96 phone thumbnail
+            covered 42% of the image, and on a photo of *someone else's*
+            holiday it reads as a sticker rather than information. The same
+            fact is a chip in the body below. */}
       </Link>
 
       <div className="product-body">
@@ -169,6 +198,10 @@ export function ProductCard({ hit, locale }: { hit: SearchHit; locale: LocaleCod
         )}
 
         <div className="row wrap" style={{ gap: 'var(--sp-3)' }}>
+          {/* The highlight leads the chip row: it is the strongest single
+              reason to pick this listing, so it reads first. */}
+          {highlight && <span className="badge badge-brand">{highlight}</span>}
+
           {hit.ratingCount > 0 && (
             <span className="rating">
               <span className="rating-stars" aria-hidden>
@@ -183,7 +216,7 @@ export function ProductCard({ hit, locale }: { hit: SearchHit; locale: LocaleCod
             </span>
           )}
 
-          {assurances.map((assurance) => (
+          {chips.map((assurance) => (
             <span key={assurance} className="badge badge-neutral">
               {assurance}
             </span>

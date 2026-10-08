@@ -4,7 +4,7 @@ import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { readFile } from 'fs/promises';
-import { basename, join, normalize } from 'path';
+import { join, normalize } from 'path';
 import { config } from './config/env';
 import { logger } from './lib/logger';
 import { checkDatabase, connectDatabase, prisma } from './lib/prisma';
@@ -17,6 +17,9 @@ import { registerErrorHandler } from './plugins/error-handler';
 import { adminRoutes } from './routes/admin.routes';
 import { authRoutes } from './routes/auth.routes';
 import { cartRoutes } from './routes/cart.routes';
+import { chatRoutes } from './routes/chat.routes';
+import { accountRoutes } from './routes/account.routes';
+import { inventoryFeedRoutes } from './routes/inventory-feed.routes';
 import { itineraryRoutes, loyaltyRoutes } from './routes/loyalty.routes';
 import { notificationRoutes } from './routes/notifications.routes';
 import { orderRoutes } from './routes/orders.routes';
@@ -28,6 +31,7 @@ import { socialRoutes } from './routes/social.routes';
 import { supportRoutes } from './routes/support.routes';
 import { ticketingRoutes } from './routes/ticketing.routes';
 import { releaseExpiredHolds } from './modules/inventory/engine';
+import { startTrvlWarmer } from './modules/supply/trvl-warmer';
 import { expireOrder } from './modules/booking/engine';
 import { OrderStatus } from '@prisma/client';
 
@@ -64,8 +68,8 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   await app.register(rateLimit, {
-    max: 300,
-    timeWindow: '1 minute',
+    max: config.rateLimit.max,
+    timeWindow: `${config.rateLimit.windowSeconds} seconds`,
     keyGenerator: (request) => request.ip,
     // Webhooks and order creation are exempt: they are either server-to-server
     // or already protected by idempotency keys + inventory holds.
@@ -152,14 +156,18 @@ export async function buildServer(): Promise<FastifyInstance> {
   await app.register(productRoutes, { prefix: '/api/v1' });
   await app.register(authRoutes, { prefix: '/api/v1' });
   await app.register(cartRoutes, { prefix: '/api/v1' });
+  await app.register(accountRoutes, { prefix: '/api/v1' });
   await app.register(orderRoutes, { prefix: '/api/v1' });
   await app.register(ticketingRoutes, { prefix: '/api/v1' });
   await app.register(socialRoutes, { prefix: '/api/v1' });
   await app.register(loyaltyRoutes, { prefix: '/api/v1' });
   await app.register(itineraryRoutes, { prefix: '/api/v1' });
   await app.register(adminRoutes, { prefix: '/api/v1' });
+  // Flag-gated: returns 404 while INVENTORY_FEED_ENABLED=false.
+  await app.register(inventoryFeedRoutes, { prefix: '/api/v1' });
   await app.register(promoRoutes, { prefix: '/api/v1' });
   await app.register(supportRoutes, { prefix: '/api/v1' });
+  await app.register(chatRoutes, { prefix: '/api/v1' });
   await app.register(notificationRoutes, { prefix: '/api/v1' });
   await app.register(realtimeRoutes, { prefix: '/api/v1' });
 
@@ -225,10 +233,13 @@ async function main(): Promise<void> {
   });
 
   const sweeper = startBackgroundJobs();
+  // Null when trvl is disabled, in which case there is nothing to clean up.
+  const warmer = startTrvlWarmer();
 
   const shutdown = async (signal: string) => {
     logger.info('server.shutdown_requested', { signal });
     clearInterval(sweeper);
+    if (warmer) clearInterval(warmer);
     await app.close();
     await closeRealtimeBus();
     await prisma.$disconnect();

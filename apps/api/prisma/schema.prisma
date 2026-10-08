@@ -28,14 +28,21 @@ datasource db {
 // Identity & tenancy
 // ===========================================================================
 
+/// Two staff surfaces, and only two: `/admin` (operations) and `/support`
+/// (customer service).
+///
+/// `MERCHANT` and `OPERATOR` were folded in deliberately — the gate scanner and
+/// the partner-merchant views are ADMIN capabilities now rather than roles of
+/// their own. A third role is a third set of permissions to get wrong, and the
+/// two-surface console already models the split the platform actually needs.
+/// See docs/adr/0002-two-staff-surfaces.md.
 enum UserRole {
   CUSTOMER
-  MERCHANT
-  // Gate staff: can verify and redeem tickets, nothing else.
-  OPERATOR
-  // Customer support: can look up orders and users and issue refunds, but
-  // cannot change catalogue, pricing or other people's balances.
+  // Customer support: can look up orders and users, adjust records and issue
+  // refunds, but cannot change catalogue, pricing or other people's balances.
   SUPPORT
+  // Operations: everything SUPPORT can do, plus the catalogue, pricing,
+  // inventory, promo banners and gate scanning.
   ADMIN
 }
 
@@ -73,6 +80,12 @@ model User {
   travelerProfiles TravelerProfile[]
   sessions         UserSession[]
   walletLedger     WalletTransaction[]
+  paymentMethods   PaymentMethod[]
+
+  emailVerifications    EmailVerificationCode[]
+  supportConversations  SupportConversation[] @relation("ConversationCustomer")
+  assignedConversations SupportConversation[] @relation("ConversationAssignee")
+  supportMessages       SupportMessage[]
 
   @@index([role])
 }
@@ -87,6 +100,36 @@ model UserSession {
   expiresAt DateTime
 
   @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Email verification
+//
+// Registration issues a short numeric code instead of trusting the address
+// immediately. Only a hash of the code is stored — the same reasoning as
+// `User.passwordHash`: a leaked database must not hand an attacker a working
+// code for every account. Codes are single-use and expire.
+// ---------------------------------------------------------------------------
+
+model EmailVerificationCode {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// SHA-256 of the code. The plaintext is never persisted.
+  codeHash String
+  /// How long this code stays valid.
+  expiresAt DateTime
+  /// Set the moment the code is accepted, so a reused code matches zero rows
+  /// and is rejected without a special case.
+  consumedAt DateTime?
+  /// Wrong guesses so far. Past a small threshold the code is treated as dead,
+  /// which caps online brute-force of a six-digit space.
+  attempts Int @default(0)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, consumedAt])
 }
 
 model TravelerProfile {
@@ -106,6 +149,64 @@ model TravelerProfile {
   orderTravelers OrderTraveler[]
 
   @@index([userId])
+}
+
+/// What a stored payment credential authorises.
+///
+/// Mirrors `CredentialKind` in `modules/supply/credentials.ts` so the audit is
+/// queryable in the database rather than living only in prose. A saved card and
+/// a saved TRC20 address are both `SETTLEMENT` — the power to move real money —
+/// which is why neither is *usable* until the stage boundary admits that class.
+enum CredentialClass {
+  PUBLIC
+  API_KEY
+  SUPPLIER
+  BOOKING
+  SETTLEMENT
+}
+
+/// A saved, reusable payment credential belonging to a shopper.
+///
+/// Hard rule, enforced by `pnpm credentials:contract`:
+/// **no PAN, expiry or CVC is ever stored here.** Only a gateway-issued token
+/// (or, for a self-custodial crypto address, the public receiving address) plus
+/// the display fragments the client already knows. Storing a card number would
+/// put the platform in PCI scope for no gain — the token is the whole point.
+model PaymentMethod {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  channel PaymentChannel
+  /// `visa` | `mastercard` | `amex` | `paypal` | `trc20` — display only.
+  brand   String?
+  /// Last four digits for cards / masked account for wallets. **Never** a full
+  /// number.
+  last4   String?
+  /// Operator-facing nickname ("My travel card", "USDT wallet").
+  label   String?
+
+  /// Gateway token / PayPal payer id / TRC20 receiving address. The only
+  /// credential-shaped value stored, and it is a reference, never a secret.
+  providerToken String?
+
+  /// The credential class this method exercises when used. `SETTLEMENT` for
+  /// every real rail, which is exactly why usage is boundary-gated.
+  credentialClass CredentialClass @default(SETTLEMENT)
+
+  isDefault Boolean   @default(false)
+  /// Set once the gateway has verified the method (e.g. a $0 auth or a
+  /// micro-deposit). An unverified method must not be the default.
+  verifiedAt DateTime?
+  /// Cards only; null for wallets and crypto.
+  expiresAt  DateTime?
+
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, isDefault])
+  @@index([channel])
 }
 
 // Merchants own inventory in the platform/partner model (stage 2).
@@ -134,6 +235,138 @@ model Merchant {
   @@index([status])
 }
 
+/// Provenance for a row imported from an external supply source.
+///
+/// `docs/supply-sources.md` requires that a source's licence travels with its
+/// rows so attribution can be produced from data rather than memory, and that
+/// `origin` is written at sync time and never inferred at read time. Both need a
+/// place to live: without this table an imported airport is indistinguishable
+/// from a hand-written one, and the ODbL share-alike obligation that Overture
+/// and OpenFlights carry cannot be discharged.
+///
+/// The key is `(sourceId, externalId)` rather than the row's own id, so
+/// re-running an import updates provenance in place instead of accumulating
+/// duplicates.
+model SupplySourceRecord {
+  id         String          @id @default(cuid())
+  /// Matches `SupplySource.id` — the registry key in docs/supply-sources.md.
+  sourceId   String
+  /// The row's id in the source's own namespace. Unique per source so two
+  /// datasets cannot collide on one id.
+  externalId String
+  origin     InventorySource
+
+  /// SPDX licence string for the dataset this row came from, stored verbatim.
+  license    String
+
+  /// Canonical table this row backs: `Destination` | `Product` | `TicketType`.
+  entityType String
+  /// The `id` of the canonical row. Not a foreign key: the source registry
+  /// spans several tables and a relation here would have to be nullable,
+  /// untyped and unenforced.
+  entityId   String
+
+  /// Verbatim source row, so a disputed import can be diffed against upstream
+  /// without re-running it.
+  payload    Json?
+  /// When this row was last refreshed by an import.
+  syncedAt   DateTime @default(now())
+
+  @@unique([sourceId, externalId])
+  @@index([entityType, entityId])
+  @@index([sourceId])
+  @@index([origin])
+}
+
+// ===========================================================================
+// Inventory feed: third-party rows that are staged, never sold
+//
+// A hotel row scraped from a supplier feed is *evidence*, not a listing. The
+// README's scope note stands: this platform's products are first-party records.
+// A scraped row becomes one only after an operator promotes it (see
+// `modules/inventory-feed/promote.ts`), at which point it is re-priced from our
+// own cost basis.
+//
+// The blast-radius rule is the load-bearing part:
+//   **nothing that reads `Product` may read `ScrapedInventory`**, and the ingest
+//   module must not import `pricing/`, `inventory/` or `booking/`.
+// `pnpm inventory:contract` enforces it offline.
+// ===========================================================================
+
+enum ScrapedStatus {
+  /// Freshly ingested, awaiting operator review.
+  NEW
+  /// An operator looked at it; not yet promoted.
+  REVIEWED
+  /// Promoted into a `Product`. See `Product.sourceScrapedId`.
+  PROMOTED
+  /// Deliberately not sellable (duplicate, dead link, terms). Kept so a re-run
+  /// does not resurrect it — a rejection must have somewhere to live.
+  REJECTED
+  /// Not confirmed by a recent successful sync. Cannot be promoted, and its
+  /// product is paused rather than sold at a stale price.
+  STALE
+}
+
+/// A raw hotel row as returned by the inventory scraper (Apify Expedia Hotels).
+///
+/// Deliberately NOT a Product. Scraped prices are third-party, stale and
+/// unverifiable, and — the whole reason this table exists — writing one into
+/// `TicketType.basePriceCents` would let a scraper bug become a pricing bug at
+/// scale and corrupt the `OrderItem` snapshots that explain previous orders.
+model ScrapedInventory {
+  id String @id @default(cuid())
+
+  // --- provenance: which run produced this, and when -----------------------
+  /// Namespaced feed id. Written at ingest time, never inferred at read time.
+  source String @default("apify:jupri/expedia-hotels")
+  /// Apify run id, kept so a batch can be attributed, replayed or cost-audited.
+  sourceRunId String?
+  /// Supplier hotel id (Expedia numeric). Non-null by construction: `""` means
+  /// the feed gave none, and those rows are skipped *before* insert, because
+  /// Prisma cannot put a nullable field in a `@@unique` and an unidentifiable
+  /// row could never be refreshed anyway.
+  externalId String @default("")
+  /// hotels.com-style reference, when the payload carries one.
+  externalRef String?
+  fetchedAt DateTime @default(now())
+  /// Last successful refresh that confirmed this row still exists upstream.
+  syncedAt DateTime?
+
+  // --- candidate display data (not yet a listing) --------------------------
+  name String
+  citySlug String?
+  countryCode String? @db.Char(2)
+  latitude Float?
+  longitude Float?
+  starRating Float?
+  propertyUrl String?
+
+  // --- money: evidence, never an input to `computeQuote` -------------------
+  priceCents Int?
+  currency String? @db.Char(3)
+  /// The original price string, kept so a unit/currency ambiguity is resolved
+  /// by a human rather than guessed by a parser.
+  rawPriceText String?
+  checkIn DateTime? @db.Date
+  checkOut DateTime? @db.Date
+
+  /// The untouched payload, PII stripped. Kept so a feed schema change costs a
+  /// mapping migration plus a backfill from this column — not a paid re-scrape.
+  raw Json
+
+  // --- lifecycle -----------------------------------------------------------
+  status ScrapedStatus @default(NEW)
+  /// Set on promote. Mirrors `Product.sourceScrapedId` for queue queries.
+  promotedProductId String?
+  notes String?
+
+  @@unique([source, externalId])
+  @@index([status, fetchedAt])
+  @@index([citySlug])
+  @@index([promotedProductId])
+}
+
 enum MerchantStatus {
   PENDING
   ACTIVE
@@ -149,6 +382,11 @@ enum DestinationLevel {
   REGION
   CITY
   ATTRACTION
+  /// An airport. A first-class entity rather than a free-text string on
+  /// `FlightSegment`, because connection search has to match a code that is
+  /// neither the origin nor the destination of any product — that needs an
+  /// index, and an index needs a table.
+  AIRPORT
 }
 
 model Destination {
@@ -163,6 +401,15 @@ model Destination {
   timezone     String           @default("UTC")
   latitude     Float?
   longitude    Float?
+  /// IATA airport code, e.g. `DXB`. Unique when present so a code identifies
+  /// exactly one place; nullable because a city has none.
+  iataCode     String?          @unique @db.Char(3)
+  /// ICAO code, e.g. `OMDB`. Longer and region-specific, so it cannot stand in
+  /// for the IATA code a traveller searches by.
+  icaoCode     String?          @unique @db.Char(4)
+  /// Where this row came from. Written at sync time, never inferred at read
+  /// time — see docs/supply-sources.md.
+  origin       InventorySource  @default(PLATFORM)
   description  String?
   heroImageUrl String?
   isPopular    Boolean          @default(false)
@@ -175,6 +422,11 @@ model Destination {
   @@index([parentId])
   @@index([level])
   @@index([isPopular])
+  // Serves "airports near me" and the supply import's dedupe lookup. Partial
+  // because the ~200 city rows carry a null code and would otherwise dominate
+  // the index for no query.
+  @@index([level], map: "Destination_airport_idx")
+  @@index([latitude, longitude])
 }
 
 model Neighborhood {
@@ -297,6 +549,10 @@ model Product {
 
   ticketTypes    TicketType[]
   cartItems      CartItem[]
+  // Set only when `type` is PACKAGE. Null for every other category, so a
+  // non-bundle product can never accidentally be expanded into lines.
+  bundle        ProductBundle?
+  holdGroups     InventoryHoldGroup[]
   media          ProductMedia[]
   priceRules     PriceRule[]
   tags           ProductTag[]
@@ -316,6 +572,11 @@ model Product {
   flight  ProductFlight?
   sailing ProductSailing?
   vehicle ProductVehicle?
+
+  /// Set only when this product was promoted from a scraped row. Null for every
+  /// first-party product. Provenance/reporting only — never read by pricing, and
+  /// never a source of money. Points at `ScrapedInventory.id`.
+  sourceScrapedId String? @unique
 
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
@@ -400,6 +661,12 @@ enum InventorySource {
   PLATFORM
   MERCHANT_FEED
   MANUAL
+  /// Identity and geometry imported from an open dataset (OurAirports,
+  /// GeoNames, Overture, ...). Prices and availability are still derived by
+  /// `modules/pricing` and `modules/inventory` — see docs/supply-sources.md.
+  OPEN_DATASET
+  /// Written by the pricing/inventory engines rather than by any feed.
+  SYNTHETIC
 }
 
 model TicketType {
@@ -410,6 +677,10 @@ model TicketType {
   name         String
   description  String?
   translations TicketTypeTranslation[]
+  // Ticket types that appear as a component of some bundle. A ticket type can
+  // be sold on its own *and* inside a bundle — the bundle references it, it
+  // does not take ownership, so `onDelete` is deliberately not Cascade.
+  bundleComponents BundleComponent[]
 
   // Money
   basePriceCents   Int
@@ -778,6 +1049,7 @@ model Cart {
 
   items CartItem[]
   holds InventoryHold[]
+  holdGroups InventoryHoldGroup[]
 
   @@index([userId, status])
 }
@@ -792,6 +1064,18 @@ model CartItem {
   ticketType     TicketType @relation(fields: [ticketTypeId], references: [id])
   serviceDate    DateTime   @db.Date
   timeSlot       String?
+  /// Stay range for multi-night products. Null for single-date products, which
+  /// keep using `serviceDate` alone — so every existing cart row and every
+  /// single-date code path is unaffected.
+  ///
+  /// `serviceDate` mirrors `checkInDate` when both are set, so existing queries
+  /// that filter or sort on `serviceDate` keep returning the right rows without
+  /// knowing stays exist. Nights = differenceInDays(checkOutDate, checkInDate).
+  checkInDate    DateTime?  @db.Date
+  checkOutDate   DateTime?  @db.Date
+  nights         Int?
+  /// Room type code within `ProductStay.roomTypes`. Null = "the only room we sell".
+  roomTypeCode   String?
   quantity       Int
   unitPriceCents Int
   locale         String     @default("en-US")
@@ -802,9 +1086,16 @@ model CartItem {
 }
 
 // A short-lived claim on inventory, released by the booking engine.
+//
+// One row per *unit of time claimed*. A single-date attraction has exactly one.
+// A 3-night stay has three, all sharing one hold group's token — that is how a
+// multi-night booking occupies every night atomically without this table needing
+// to know it is part of a set.
 model InventoryHold {
   id                String          @id @default(cuid())
   holdToken         String          @unique
+  groupId           String?
+  group             InventoryHoldGroup? @relation(fields: [groupId], references: [id], onDelete: Cascade)
   cartId            String?
   cart              Cart?           @relation(fields: [cartId], references: [id])
   userId            String?
@@ -818,6 +1109,55 @@ model InventoryHold {
 
   @@index([status, expiresAt])
   @@index([userId])
+  @@index([groupId])
+}
+
+/// Every hold placed by one checkout attempt, across all of its dates.
+///
+/// Why a group exists
+/// -----------------
+/// `InventoryHold` claims one `InventoryRecord`, which is one (ticketType, date,
+/// slot) row — structurally single-date. A hotel stay needs the same room held on
+/// every night of the range, and it must be all-or-nothing: if night 3 is sold out
+/// then nights 1 and 2 must not stay blocked.
+///
+/// Rather than reshape `InventoryHold` (and with it `releaseHold`/`consumeHold`
+/// and every existing caller), a group owns the token and the children own the
+/// arithmetic. Release and consume look the group up by token and fan out, so
+/// their public signatures — and every call site — stay exactly as they were.
+///
+/// A single-date product still creates a group, with one child. Uniformity matters
+/// here: two divergent code paths for "one night" vs "many" is how the single-date
+/// case quietly rots.
+model InventoryHoldGroup {
+  id         String   @id @default(cuid())
+  /// The token the booking engine already passes to release/consume. Unique so a
+  /// token resolves to exactly one group, and to exactly one row when no children
+  /// exist yet.
+  holdToken  String   @unique
+  cartId     String?
+  cart       Cart?    @relation(fields: [cartId], references: [id])
+  userId     String?
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id])
+  /// HOTEL_ROOM / CRUISE / RENTAL_CAR: the booking spans a date range. Otherwise
+  /// the group carries a single date and `nights` is 1.
+  checkInDate DateTime? @db.Date
+  checkOutDate DateTime? @db.Date
+  nights      Int      @default(1)
+  /// Denormalised so a group listing does not have to aggregate its children.
+  /// `quantity` is the rooms/units; `nights * quantity` is the rows held.
+  quantity   Int      @default(1)
+  status     String   @default("ACTIVE") // ACTIVE | RELEASED | CONSUMED | EXPIRED
+  expiresAt  DateTime
+  releasedAt DateTime?
+  createdAt  DateTime @default(now())
+
+  holds InventoryHold[]
+
+  @@index([status, expiresAt])
+  @@index([userId])
+  @@index([productId])
 }
 
 // ===========================================================================
@@ -848,6 +1188,10 @@ enum PaymentChannel {
   WALLET
   VOUCHER
   CASH_ON_SITE
+  /// Self-custodial Tron (TRC20) USDT settlement. Modelled in this stage;
+  /// sandbox-only, and gated by the same credential boundary as every other
+  /// settlement rail — see modules/supply/credentials.ts.
+  CRYPTO_TRC20
 }
 
 enum PaymentStatus {
@@ -920,6 +1264,8 @@ model Order {
   orderStatusLogs OrderStatusLog[]
   transferLegs    TransferLeg[]
 
+  supportConversations SupportConversation[]
+
   @@index([status, placedAt])
   @@index([userId, placedAt])
   @@index([contactEmail])
@@ -942,6 +1288,17 @@ model OrderItem {
 
   serviceDate DateTime @db.Date
   timeSlot    String?
+  /// Stay range snapshot. Copied from `CartItem` at checkout so the order keeps
+  /// the dates it was actually priced for even if the cart item is later edited.
+  /// Null for single-date products.
+  checkInDate  DateTime? @db.Date
+  checkOutDate DateTime? @db.Date
+  nights       Int?
+  roomTypeCode String?
+  /// Price of one room for one night. `unitPriceCents` on a stay line is the
+  /// per-night figure, matching how `Product.basePriceCents` reads for a hotel;
+  /// `lineTotalCents` is what the customer pays for the whole stay.
+  nightlyPriceCents Int?
   quantity    Int
   adultCount  Int      @default(0)
   childCount  Int      @default(0)
@@ -1237,21 +1594,6 @@ model CouponRedemption {
   @@index([orderId])
 }
 
-model Promotion {
-  id        String    @id @default(cuid())
-  slug      String    @unique
-  title     String
-  subtitle  String?
-  body      String?
-  bannerUrl String?
-  ctaLabel  String?
-  ctaUrl    String?
-  startsAt  DateTime
-  endsAt    DateTime?
-  position  Int       @default(0)
-  active    Boolean   @default(true)
-  createdAt DateTime  @default(now())
-}
 
 // ===========================================================================
 // Reviews & social proof
@@ -1581,6 +1923,82 @@ model AuditLog {
   @@index([createdAt])
 }
 
+// ===========================================================================
+// Customer support chat
+//
+// An embedded conversation between a signed-in shopper and the support console.
+// Deliberately a *durable thread*, not a transient socket: the WebSocket pushes
+// new messages live, but every message is a row, so the widget and the inbox
+// both rehydrate from Postgres after a reload. Realtime is the push; this is
+// the record — the same split used by `Notification`.
+// ===========================================================================
+
+enum SupportConversationStatus {
+  OPEN
+  CLOSED
+}
+
+enum SupportAuthorType {
+  CUSTOMER
+  AGENT
+  // Platform-generated lines: "Casey joined the chat", "Conversation closed".
+  SYSTEM
+}
+
+model SupportConversation {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation("ConversationCustomer", fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Optional link to the order the shopper is asking about, so an agent opens
+  /// the thread with context instead of hunting for the order number.
+  orderId String?
+  order   Order?  @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  subject String
+
+  status           SupportConversationStatus @default(OPEN)
+  assignedToUserId String?
+  assignedTo       User?                    @relation("ConversationAssignee", fields: [assignedToUserId], references: [id], onDelete: SetNull)
+
+  /// Unread counters are maintained on write rather than aggregated on read, so
+  /// the widget and inbox badges are a single indexed lookup. `customerUnread`
+  /// counts agent messages the shopper has not seen; `staffUnread` the reverse.
+  customerUnread Int @default(0)
+  staffUnread    Int @default(0)
+
+  /// Denormalised from the newest message so a conversation list can be sorted
+  /// and rendered without loading every message.
+  lastMessageAt DateTime @default(now())
+  lastPreview   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages SupportMessage[]
+
+  @@index([userId, status])
+  @@index([status, lastMessageAt])
+  @@index([assignedToUserId])
+}
+
+model SupportMessage {
+  id             String              @id @default(cuid())
+  conversationId String
+  conversation   SupportConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  authorType   SupportAuthorType
+  authorUserId String?
+  author       User?              @relation(fields: [authorUserId], references: [id], onDelete: SetNull)
+
+  body      String
+  createdAt DateTime @default(now())
+  /// When the *recipient* read it. Null on the author's own message.
+  readAt    DateTime?
+
+  @@index([conversationId, createdAt])
+}
+
 // Daily revenue aggregates powering the operator dashboard.
 model DailyMetric {
   id               String   @id @default(cuid())
@@ -1612,6 +2030,14 @@ enum WalletTransactionKind {
   REFUND
   ADJUSTMENT
   REVERSAL
+  /// Customer-funded balance increase (充值). Distinct from CREDIT, which is a
+  /// *platform* credit (a goodwill adjustment), because the two have different
+  /// provenance and a statement must be able to tell them apart.
+  TOP_UP
+  /// Customer-requested payout (取现). The spendable balance drops the moment
+  /// the request is accepted so the same funds cannot also be spent; delivery
+  /// of the money is the payout rail's problem, not the ledger's.
+  WITHDRAWAL
 }
 
 model WalletTransaction {
@@ -1762,15 +2188,14 @@ model ProductFlight {
   /// Number of sectors on the default itinerary, cached for cheap filtering.
   segmentCount Int @default(1)
 
-  /// Ordered legs. Each entry:
-  /// { seq, marketingCarrier, operatingCarrier?, flightNumber, aircraft,
-  ///   departure: { airport, terminal?, scheduledAt, actualAt?, offset },
-  ///   arrival:   { airport, terminal?, scheduledAt, actualAt?, offset },
-  ///   durationMinutes, cabinCode, bookingClass, fareFamily }
+  /// Ordered legs. Each entry mirrors a `FlightSegment` row for the default
+  /// itinerary, and is kept in step by the backfill.
   ///
-  /// Ordered segments genuinely need sequence and cross-leg queries, which a
-  /// Json blob makes awkward to index. This is the first candidate for a real
-  /// `FlightSegment` table if itinerary search or rebooking lands.
+  /// The Json copy exists so a product detail read never needs a join, and so an
+  /// itinerary survives if the segment rows are re-derived. `FlightSegment` is
+  /// the queryable copy: connection and stopover search needs to filter on
+  /// arrival/departure airports and layover length, which a Json blob cannot
+  /// index. Read through the table, not this field.
   segments Json @default("[]")
 
   /// Sellable fare families. Each entry:
@@ -1789,6 +2214,68 @@ model ProductFlight {
 
   @@index([marketingCarrier])
   @@index([segmentCount])
+
+  /// Queryable itinerary legs. `segments` above is the same data denormalised
+  /// for single-row reads; this relation is what connection search queries.
+  itinerary FlightSegment[]
+}
+
+/// One leg of a flight's default itinerary, as a row rather than Json.
+///
+/// Two questions make this worth a table. "Which flights connect through HKG?"
+/// needs to match on a departure or arrival airport that is neither the origin
+/// nor the destination of the product. "Which itineraries have a 3-hour
+/// layover at LHR?" needs to subtract one arrival from the next departure.
+/// Neither is expressible against a Json blob without scanning and parsing every
+/// product in Postgres, and neither can be pushed down to OpenSearch.
+///
+/// Times are stored in UTC. `scheduledAt` is what the airline published;
+/// `actualAt` is filled by the operating carrier after the fact and stays null
+/// for a schedule that has not flown yet. An airport without an offset in the
+/// seed carries a null time rather than a guessed one.
+model FlightSegment {
+  id String @id @default(cuid())
+
+  productId String
+  product   ProductFlight @relation(fields: [productId], references: [productId], onDelete: Cascade)
+
+  /// 1-based position in the itinerary. Unique per product so an itinerary
+  /// cannot contain two indistinguishable legs at the same position.
+  seq Int
+
+  marketingCarrier String
+  operatingCarrier String?
+  /// 2-letter IATA of the marketing carrier, when the carrier table knows it.
+  /// Indexable shorthand for `marketingCarrier`, which may hold a full name.
+  marketingCarrierCode String?
+  flightNumber     String?
+  aircraft         String?
+
+  departureAirport     String
+  departureTerminal    String?
+  departureScheduledAt DateTime?
+  departureActualAt    DateTime?
+
+  arrivalAirport     String
+  arrivalTerminal    String?
+  arrivalScheduledAt DateTime?
+  arrivalActualAt    DateTime?
+
+  /// Scheduled block time in minutes. Null when the schedule has no times yet:
+  /// deriving it from two null timestamps would invent precision.
+  durationMinutes Int?
+  cabinCode       String?
+  bookingClass    String?
+  fareFamily      String?
+
+  @@unique([productId, seq])
+  @@index([productId])
+  @@index([departureAirport])
+  @@index([arrivalAirport])
+  @@index([marketingCarrierCode])
+  /// Serves "connections through this airport": a layover is an arrival at one
+  /// segment and a departure from the next, so both airports must be indexed.
+  @@index([departureAirport, arrivalAirport])
 }
 
 /// Cruise: one sailing of a ship, including its port itinerary and cabins.
@@ -1856,4 +2343,104 @@ model ProductVehicle {
   updatedAt DateTime @updatedAt
 
   @@index([serviceKind])
+}
+
+// ===========================================================================
+// Bundles — a flight and a room sold as one indivisible thing
+// ===========================================================================
+
+/// A pre-composed itinerary sold as a single product: "flight + 3 nights in
+/// Rome + airport transfer". The bundle is the Product (type `PACKAGE`) the
+/// customer browses and adds to the cart; the components below are what it
+/// actually books.
+///
+/// Why the bundle is atomic
+/// -----------------------
+/// Selling a flight without the hotel it was priced against is worse than
+/// selling neither: the customer has a flight to a city with no room and a
+/// bundle discount they cannot use. So a bundle resolves to N component lines
+/// and they are held, sold and released together — the booking engine already
+/// rolls back every hold it took when any line in the order fails, which is
+/// exactly the guarantee needed here. `expandBundle` is the single place that
+/// turns a bundle into lines, so the guarantee lives in one function rather
+/// than being spread across every call site.
+///
+/// Components point at a `TicketType`, not a `Product`, because that is the
+/// unit the booking engine already prices and holds. A hotel component naming
+/// the room tier, a flight component naming the cabin, is the same row the
+/// customer would have booked separately.
+model ProductBundle {
+  productId String  @id
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  /// Human-readable summary shown before expanding, e.g. "Return flight +
+  /// 3 nights central Rome + private airport transfer".
+  summary String?
+
+  /// { flight: true, stay: true, groundTransport: true, notes: "..." } — which
+  /// component kinds the customer can expect. Descriptive only; `components` is
+  /// the authority on what is actually included.
+  includes Json @default("{}")
+
+  /// Bundle-level conditions that apply to the whole trip rather than to one
+  /// component: { minNights, maxNights, cancellationDeadlineHours,
+  ///   priceGuaranteedUntil, notes }
+  policies Json @default("{}")
+
+  /// What the bundle saves against booking the components separately. Computed
+  /// from live component prices at read time rather than stored, so it cannot
+  /// drift out of date when a component repriced.
+  displayDiscountLabel String?
+
+  updatedAt DateTime @updatedAt
+
+  components BundleComponent[]
+}
+
+/// One sellable line inside a bundle.
+///
+/// `quantity` is rooms/tickets within the component. `required` marks a
+/// component the bundle cannot be sold without: a flight is required, an
+/// optional add-on (a museum pass, a lounge key) is not. Expands into
+/// `required` lines always, optional ones only when requested.
+model BundleComponent {
+  id        String        @id @default(cuid())
+  bundleId  String
+  bundle    ProductBundle @relation(fields: [bundleId], references: [productId], onDelete: Cascade)
+
+  /// The component kind, for display and for grouping lines on the order.
+  /// FLIGHT | STAY | GROUND_TRANSPORT | ADDON | ACTIVITY
+  kind String
+
+  /// The unit the booking engine prices and holds.
+  ticketTypeId String
+  ticketType   TicketType @relation(fields: [ticketTypeId], references: [id])
+
+  /// Headline for the bundle card, e.g. "Return flight SIN–FCO".
+  label String
+
+  /// Free-text ordering hint. Position is presentation, not identity, so two
+  /// components of the same kind keep a stable order without a sequence column.
+  position Int @default(0)
+
+  /// Optional components are offered but not booked unless asked for.
+  required Boolean @default(true)
+
+  /// Rooms/tickets for this component. A 3-night hotel component still books one
+  /// room; the stay range lives on the expanded line, not here.
+  quantity Int @default(1)
+
+  /// Which piece of a multi-night stay this component is. `null` for anything
+  /// that is not a stay. A stay component sets `stayNights`, and expansion
+  /// produces a range long enough to cover it.
+  stayNights Int?
+
+  /// Offset from the bundle's start date, in days. Lets a component start on a
+  /// different day from the bundle — a flight lands day 0, the stay begins day 1
+  /// because arrival is that evening. Null means "starts with the bundle".
+  startOffsetDays Int?
+
+  @@unique([bundleId, ticketTypeId, position])
+  @@index([bundleId])
+  @@index([ticketTypeId])
 }

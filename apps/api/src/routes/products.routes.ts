@@ -1,13 +1,70 @@
+import { ProductType } from '@prisma/client';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { logger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
 import { resolveLocale } from '../plugins/auth';
 import { getAvailabilityCalendar, releaseExpiredHolds } from '../modules/inventory/engine';
 import { computeQuote } from '../modules/pricing/engine';
-import { addDays, toServiceDate } from '../utils/date';
+import { liveAirTrafficNear } from '../modules/supply/live-content';
+import { liveRates } from '../modules/supply/live-adapters';
+import { LIVE_CATEGORY_BY_PRODUCT_TYPE, type LivePriceInfo } from '../modules/supply/live';
+import { addDays, formatServiceDate, toServiceDate } from '../utils/date';
 import { AppError, assertFound } from '../utils/errors';
 
 /** Full product detail page payload - the workhorse of the whole frontend. */
+/**
+ * Live net rate per ticket type for the detail page.
+ *
+ * Keyed by `ticketType.id` because every variant of one product quotes the same
+ * upstream net cost: the source prices a route or a room, not a fare bucket. The
+ * variants still differ afterwards, because `computeQuote` applies each one's own
+ * tax and fee. Spreading one upstream price across buckets without letting those
+ * diverge would quietly erase the differences between economy and business.
+ *
+ * Failure is absorbed. A live layer that throws must not take down the detail
+ * page — the shopper gets seeded prices, which is a lesser outcome than an error.
+ */
+async function resolveLiveRatesForDetail(
+  product: { slug: string; type: ProductType; ticketTypes: { id: string; currency: string }[] },
+  selectedDate: string,
+  quantity: number,
+): Promise<Map<string, LivePriceInfo>> {
+  const out = new Map<string, LivePriceInfo>();
+  if (!liveRates.enabled || product.ticketTypes.length === 0) return out;
+
+  const category = LIVE_CATEGORY_BY_PRODUCT_TYPE[product.type];
+  if (!category) return out;
+
+  // Variants can disagree on currency, so the first one is not representative.
+  // A product whose variants straddle currencies is priced inconsistently by the
+  // platform anyway, and silently picking one would compound that.
+  const currency = product.ticketTypes[0]!.currency;
+
+  const result = await liveRates
+    .resolve({ slug: product.slug, category, serviceDate: selectedDate, quantity, currency }, 'detail')
+    .catch((error: unknown) => {
+      logger.warn('live.detail_resolve_failed', {
+        slug: product.slug,
+        reason: (error as Error).message,
+      });
+      return null;
+    });
+
+  if (!result?.quote) return out;
+
+  const info: LivePriceInfo = {
+    netPriceCents: result.quote.netPriceCents,
+    currency: result.quote.currency,
+    sourceId: result.quote.sourceId,
+    degraded: result.degraded,
+  };
+  for (const ticketType of product.ticketTypes) {
+    if (ticketType.currency === currency) out.set(ticketType.id, info);
+  }
+  return out;
+}
+
 export async function productRoutes(app: FastifyInstance): Promise<void> {
   app.get('/products/:slug', async (request) => {
     const { slug } = z.object({ slug: z.string().min(1) }).parse(request.params);
@@ -30,6 +87,16 @@ export async function productRoutes(app: FastifyInstance): Promise<void> {
         destination: { include: { parent: true } },
         merchant: { select: { id: true, name: true, slug: true, ratingAvg: true, ratingCount: true } },
         cancellationPolicy: true,
+        // Category extensions (Phase 0). Included so the detail response can
+        // carry them — without this the room grid, stay policies, flight
+        // segments and sailing ports are all written to the database and never
+        // reach a guest. Same "writer without a reader" shape as the search
+        // facets. Optional, so a non-stay product simply gets nulls.
+        stay: true,
+        flight: true,
+        sailing: true,
+        vehicle: true,
+        bundle: { include: { components: { orderBy: { position: 'asc' } } } },
         ticketTypes: {
           where: { active: true },
           orderBy: [{ position: 'asc' }, { basePriceCents: 'asc' }],
@@ -76,11 +143,25 @@ export async function productRoutes(app: FastifyInstance): Promise<void> {
     const today = toServiceDate(new Date());
     const selectedDate = query.date ? toServiceDate(query.date) : today;
 
+    // The detail page prices at `detail` freshness: one refresh per page view,
+    // cached briefly, because a shopper comparing products should not pay for a
+    // fresh upstream call per tab. A miss leaves `basePriceCents` alone.
+    //
+    // The live *net* rate replaces only the `basePriceCents` input. Markup, tax
+    // and fee stay inside `computeQuote` exactly as for a seeded price, so the
+    // platform never hands out an upstream number as a retail one.
+    const liveByTicketType = await resolveLiveRatesForDetail(
+      product,
+      formatServiceDate(selectedDate),
+      quantity,
+    );
+
     // Price every variant for the selected date so the ticket picker and the
     // calendar always agree with what checkout will charge.
     const ticketTypes = product.ticketTypes.map((ticketType) => {
+      const live = liveByTicketType.get(ticketType.id);
       const quote = computeQuote({
-        basePriceCents: ticketType.basePriceCents,
+        basePriceCents: live?.netPriceCents ?? ticketType.basePriceCents,
         compareAtPriceCents: ticketType.compareAtCents,
         taxBps: ticketType.taxBps,
         feeBps: ticketType.feeBps,
@@ -131,6 +212,15 @@ export async function productRoutes(app: FastifyInstance): Promise<void> {
       };
     });
 
+    // Real-time content for the detail page. Fire-and-forget on purpose: an
+    // upstream outage must add latency to nothing, and `liveAirTrafficNear`
+    // already swallows its own errors and returns `null`. Awaiting it would make
+    // a 60s-cached external call sit in the critical path of every product view.
+    //
+    // Only flights qualify, and `liveAirTrafficNear` returns `null` for every
+    // other type, so this costs one indexed lookup for a hotel.
+    const liveContentPromise = liveAirTrafficNear(product.slug);
+
     const ratingBreakdown = await prisma.ratingBreakdown.findMany({
       where: { productId: product.id },
       orderBy: { stars: 'desc' },
@@ -149,6 +239,11 @@ export async function productRoutes(app: FastifyInstance): Promise<void> {
       take: 8,
       include: { product: { include: { media: { orderBy: { position: 'asc' }, take: 1 }, translations: { take: 1 } } } },
     });
+
+    // The one place this page waits on an external source. Every other field
+    // above is already resolved, so the added latency is bounded by the 8s
+    // upstream timeout and the 60s cache absorbs the repeats.
+    const liveContent = await liveContentPromise;
 
     return {
       id: product.id,
@@ -233,6 +328,103 @@ export async function productRoutes(app: FastifyInstance): Promise<void> {
             description: product.cancellationPolicy.description,
           }
         : null,
+
+      /**
+       * Category depth. Exactly one of these is non-null, decided by the
+       * product's type rather than by which extension row happens to exist —
+       * a hotel with no backfilled `stay` row should read as "unknown", not as
+       * a ticket with missing fields.
+       *
+       * The `Json` columns are passed through as parsed values. They are
+       * written only by the backfill and the seed, so they are trusted; but
+       * every numeric bound inside `policies` may legitimately be `null` ("not
+       * supplied by a feed"), which is why the client must treat absent and
+       * zero as different things.
+       */
+      stay: product.stay
+        ? {
+            propertyType: product.stay.propertyType,
+            starRating: product.stay.starRating,
+            brand: product.stay.brand,
+            checkInTime: product.stay.checkInTime,
+            checkOutTime: product.stay.checkOutTime,
+            roomTypes: product.stay.roomTypes,
+            policies: product.stay.policies,
+            roomTypeTranslations: product.stay.roomTypeTranslations,
+          }
+        : null,
+      flight: product.flight
+        ? {
+            marketingCarrier: product.flight.marketingCarrier,
+            marketingCarrierCode: product.flight.marketingCarrierCode,
+            operatingCarrier: product.flight.operatingCarrier,
+            alliance: product.flight.alliance,
+            segmentCount: product.flight.segmentCount,
+            segments: product.flight.segments,
+            cabins: product.flight.cabins,
+            fareFamilies: product.flight.fareFamilies,
+            ticketingRules: product.flight.ticketingRules,
+          }
+        : null,
+      sailing: product.sailing
+        ? {
+            shipName: product.sailing.shipName,
+            lineName: product.sailing.lineName,
+            lineCode: product.sailing.lineCode,
+            shipCode: product.sailing.shipCode,
+            // A sailing is a departure, not a date range: `nights` plus the two
+            // ports is what makes "which ship, when, from where, for how long"
+            // answerable without a lookup.
+            sailDate: product.sailing.sailDate,
+            nights: product.sailing.nights,
+            embarkationPort: product.sailing.embarkationPort,
+            returnPort: product.sailing.returnPort,
+            embarkationClosesAt: product.sailing.embarkationClosesAt,
+            ports: product.sailing.ports,
+            cabinCategories: product.sailing.cabinCategories,
+            inclusions: product.sailing.inclusions,
+          }
+        : null,
+      vehicle: product.vehicle
+        ? {
+            serviceKind: product.vehicle.serviceKind,
+            vehicleClasses: product.vehicle.vehicleClasses,
+            transferOptions: product.vehicle.transferOptions,
+            rentalPolicy: product.vehicle.rentalPolicy,
+            supplyPolicy: product.vehicle.supplyPolicy,
+          }
+        : null,
+      /**
+       * What a package is made of. The headline price is deliberately absent —
+       * it is derived from the components at read time so it cannot drift when a
+       * component reprices.
+       */
+      bundle: product.bundle
+        ? {
+            components: product.bundle.components.map((component) => ({
+              kind: component.kind,
+              label: component.label,
+              position: component.position,
+              required: component.required,
+              startOffsetDays: component.startOffsetDays,
+              stayNights: component.stayNights,
+              quantity: component.quantity,
+            })),
+          }
+        : null,
+      /**
+       * Real-time content, when there is any. Advisory only — see
+       * `modules/supply/live-content.ts`. Absent (`undefined`) means "no live
+       * source answered", which is distinct from `null` meaning "no such
+       * product"; the UI renders nothing in either case.
+       */
+      live: liveContent ?? undefined,
+      /**
+       * Live rate provenance, present only when an upstream priced this product.
+       * The displayed price already includes platform markup; `netPriceCents` is
+       * the cost that went into it, kept so support can explain the difference.
+       */
+      liveRate: liveByTicketType.size > 0 ? [...liveByTicketType.values()][0]! : undefined,
       selectedDate: selectedDate.toISOString().slice(0, 10),
       quantity,
       ticketTypes,

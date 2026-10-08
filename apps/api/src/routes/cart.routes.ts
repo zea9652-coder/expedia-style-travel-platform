@@ -1,10 +1,12 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { CartStatus, type Prisma } from '@prisma/client';
+import { CartStatus, ProductType, type Prisma } from '@prisma/client';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { createPendingOrder } from '../modules/booking/engine';
+import { expandBundle } from '../modules/booking/bundle';
 import { computeQuote } from '../modules/pricing/engine';
+import { assertStayLengthAllowed, stayNights } from '../modules/inventory/engine';
 import { resolveLocale } from '../plugins/auth';
 import { AppError, assertFound } from '../utils/errors';
 import { toServiceDate } from '../utils/date';
@@ -24,11 +26,24 @@ type CartTicketType = Prisma.TicketTypeGetPayload<{
   include: { product: { include: { priceRules: true } }; priceRules: true };
 }>;
 
+/**
+ * Prices one cart line.
+ *
+ * `nights` is what activates the `LENGTH_OF_STAY` rule family. It was optional
+ * in the pricing context and nothing ever passed it, so a "3 nights for the price
+ * of 2" rule would have priced every stay at one night's rate — the rule kind
+ * existed, and was entirely dormant.
+ *
+ * The returned figure is per room per night. `lineTotal` multiplies it by rooms
+ * and nights, which is why a stay line and a ticket line need different totals
+ * for the same unit price.
+ */
 function quoteUnitPrice(
   ticketType: CartTicketType,
   serviceDate: Date,
   quantity: number,
   timeSlot: string,
+  nights = 1,
 ): number {
   const quote = computeQuote({
     basePriceCents: ticketType.basePriceCents,
@@ -49,7 +64,7 @@ function quoteUnitPrice(
       endsAt: rule.endsAt,
       active: rule.active,
     })),
-    context: { serviceDate, quoteDate: new Date(), quantity, timeSlot },
+    context: { serviceDate, quoteDate: new Date(), quantity, timeSlot, nights },
   });
   return quote.totalPerUnitCents;
 }
@@ -184,12 +199,21 @@ async function cartPayload(cartId: string, locale: string) {
         optionName: ticketTranslation?.name ?? item.ticketType.name,
         serviceDate: item.serviceDate.toISOString().slice(0, 10),
         timeSlot: item.timeSlot,
+        // Stay fields are null for single-date lines, so the storefront can render
+        // "3 nights × 2 rooms" when they are present and fall back to a plain
+        // ticket row when they are not.
+        checkInDate: item.checkInDate?.toISOString().slice(0, 10) ?? null,
+        checkOutDate: item.checkOutDate?.toISOString().slice(0, 10) ?? null,
+        nights: item.nights,
+        roomTypeCode: item.roomTypeCode,
         quantity: item.quantity,
         minPerOrder: item.ticketType.minPerOrder,
         maxPerOrder: item.ticketType.maxPerOrder,
         unitPriceCents: item.unitPriceCents,
         currency: item.ticketType.currency,
-        lineTotalCents: item.unitPriceCents * item.quantity,
+        // A stay is per room per night, so a 3-night × 2-room line is 6 units at
+        // the nightly rate. A ticket line has nights = 1 and reduces to quantity.
+        lineTotalCents: item.unitPriceCents * item.quantity * (item.nights ?? 1),
       };
     }),
   };
@@ -202,6 +226,130 @@ export async function cartRoutes(app: FastifyInstance): Promise<void> {
     return { ...payload, guestToken: 'newGuestToken' in cart ? cart.newGuestToken : undefined };
   });
 
+  /**
+   * Adds a package to the cart as its component lines.
+   *
+   * A bundle is not a separate order type — it is expanded into ordinary cart
+   * lines here, and everything downstream (pricing, holds, payment, refunds)
+   * already handles multi-line carts correctly. That is why the checkout engine
+   * needed no bundle awareness at all: by the time an order exists, the bundle
+   * is already N independent lines that the existing rollback holds together.
+   *
+   * Each component needs its own availability check, because a package whose
+   * flight is sold out must not sit in the cart as a silently broken promise.
+   */
+  app.post('/cart/bundle', async (request) => {
+    const cart = await resolveCart(request);
+    const body = z
+      .object({
+        productId: z.string().min(1),
+        serviceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        quantity: z.number().int().min(1).max(20),
+      })
+      .parse(request.body);
+
+    const bundle = await prisma.productBundle.findUnique({
+      where: { productId: body.productId },
+      include: { product: true, components: { orderBy: { position: 'asc' } } },
+    });
+    if (!bundle || bundle.product.type !== ProductType.PACKAGE) {
+      throw AppError.notFound('No such package');
+    }
+
+    const startDate = toServiceDate(body.serviceDate);
+    if (startDate.getTime() < toServiceDate(new Date()).getTime()) {
+      throw AppError.validation('Service date cannot be in the past');
+    }
+
+    const ticketTypes = await prisma.ticketType.findMany({
+      where: { id: { in: bundle.components.map((c) => c.ticketTypeId) }, active: true },
+    });
+    const byId = new Map(ticketTypes.map((t) => [t.id, t]));
+
+    const expanded = expandBundle(
+      bundle.components.map((c) => ({
+        ticketTypeId: c.ticketTypeId,
+        kind: c.kind,
+        label: c.label,
+        position: c.position,
+        required: c.required,
+        quantity: c.quantity,
+        stayNights: c.stayNights,
+        startOffsetDays: c.startOffsetDays,
+      })),
+      {
+        bundleProductId: bundle.productId,
+        startDate,
+        quantity: body.quantity,
+        availableTicketTypeIds: new Set(ticketTypes.map((t) => t.id)),
+      },
+    );
+
+    await prisma.$transaction(async (tx) => {
+      const openCart = await lockOpenCart(tx, cart.id);
+      const itemCount = await tx.cartItem.count({ where: { cartId: cart.id } });
+
+      if (itemCount === 0) {
+        // An empty cart adopts the currency of whatever is first added to it —
+        // its own `currency` column is only a `USD` default until then. This has
+        // to happen *before* any validation below, otherwise a first add of a
+        // non-USD bundle compares every component against a placeholder USD and
+        // rejects a cart that is, in fact, empty and consistent.
+        const first = byId.get(expanded.lines[0]?.ticketTypeId ?? '');
+        if (first) {
+          await tx.cart.update({ where: { id: cart.id }, data: { currency: first.currency } });
+        }
+      } else if (expanded.lines.some((line) => byId.get(line.ticketTypeId)?.currency !== openCart.currency)) {
+        // Validate the whole expansion at once. Checking component by component
+        // would let a two-part bundle straddle two carts' worth of state and
+        // leave the first component written when the second is rejected.
+        throw AppError.validation('A cart can contain products in one currency only');
+      }
+
+      for (const line of expanded.lines) {
+        const tt = byId.get(line.ticketTypeId)!;
+        if (body.quantity < tt.minPerOrder * line.quantity || body.quantity > tt.maxPerOrder * line.quantity) {
+          throw AppError.validation(
+            `Quantity for ${line.label} must be between ${tt.minPerOrder * line.quantity} and ${tt.maxPerOrder * line.quantity}`,
+          );
+        }
+        await tx.cartItem.create({
+          data: {
+            cartId: cart.id,
+            productId: tt.productId,
+            ticketTypeId: tt.id,
+            serviceDate: line.serviceDate,
+            timeSlot: null,
+            checkInDate: line.checkOutDate ? line.serviceDate : null,
+            checkOutDate: line.checkOutDate,
+            nights: line.checkOutDate ? line.nights : null,
+            roomTypeCode: null,
+            quantity: line.quantity,
+            unitPriceCents: quoteUnitPrice(
+              await tx.ticketType.findUniqueOrThrow({
+                where: { id: tt.id },
+                include: { product: { include: { priceRules: true } }, priceRules: true },
+              }),
+              line.serviceDate,
+              line.quantity,
+              '',
+              line.nights,
+            ),
+            locale: resolveLocale(request),
+          },
+        });
+      }
+    });
+
+    const payload = await cartPayload(cart.id, resolveLocale(request));
+    return {
+      ...payload,
+      bundleProductId: bundle.productId,
+      componentCount: expanded.lines.length,
+      droppedOptional: expanded.droppedOptional,
+    };
+  });
+
   app.post('/cart/items', async (request, reply) => {
     const cart = await resolveCart(request);
     const body = z
@@ -210,6 +358,13 @@ export async function cartRoutes(app: FastifyInstance): Promise<void> {
         serviceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
         timeSlot: z.string().max(10).nullish(),
         quantity: z.number().int().min(1).max(20),
+        /**
+         * Stay range. Supplying `checkOutDate` makes this a multi-night stay:
+         * `serviceDate` is the first night and `checkOutDate` is the departure
+         * morning. Both optional so existing single-date callers are untouched.
+         */
+        checkOutDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        roomTypeCode: z.string().max(40).optional(),
       })
       .parse(request.body);
 
@@ -232,6 +387,23 @@ export async function cartRoutes(app: FastifyInstance): Promise<void> {
     if (serviceDate.getTime() < toServiceDate(new Date()).getTime()) {
       throw AppError.validation('Service date cannot be in the past');
     }
+
+    // A stay is priced per room per night, so the line total is nights × rooms.
+    // A ticket line has no check-out, so nights is 1 and the two agree.
+    const nights = body.checkOutDate
+      ? stayNights(serviceDate, toServiceDate(body.checkOutDate)).length
+      : 1;
+    if (body.checkOutDate) {
+      // Enforce the property's stay length before anything is held or priced, so
+      // a 1-night booking against a 3-night minimum fails here rather than deep
+      // inside the booking engine.
+      const stay = await prisma.productStay.findUnique({
+        where: { productId: ticketType.productId },
+        select: { policies: true },
+      });
+      assertStayLengthAllowed(nights, stay?.policies);
+    }
+
     await prisma.$transaction(async (tx) => {
       const openCart = await lockOpenCart(tx, cart.id);
       const itemCount = await tx.cartItem.count({ where: { cartId: cart.id } });
@@ -248,8 +420,18 @@ export async function cartRoutes(app: FastifyInstance): Promise<void> {
           ticketTypeId: ticketType.id,
           serviceDate,
           timeSlot: body.timeSlot ?? null,
+          checkInDate: body.checkOutDate ? serviceDate : null,
+          checkOutDate: body.checkOutDate ? toServiceDate(body.checkOutDate) : null,
+          nights: body.checkOutDate ? nights : null,
+          roomTypeCode: body.roomTypeCode ?? null,
           quantity: body.quantity,
-          unitPriceCents: quoteUnitPrice(ticketType, serviceDate, body.quantity, body.timeSlot ?? ''),
+          unitPriceCents: quoteUnitPrice(
+            ticketType,
+            serviceDate,
+            body.quantity,
+            body.timeSlot ?? '',
+            nights,
+          ),
           locale: resolveLocale(request),
         },
       });
@@ -337,6 +519,11 @@ export async function cartRoutes(app: FastifyInstance): Promise<void> {
           serviceDate: item.serviceDate.toISOString().slice(0, 10),
           timeSlot: item.timeSlot,
           quantity: item.quantity,
+          // Stay range. Null for single-date items, and the booking engine treats
+          // a line without both dates as a normal one-day booking.
+          checkInDate: item.checkInDate?.toISOString().slice(0, 10) ?? null,
+          checkOutDate: item.checkOutDate?.toISOString().slice(0, 10) ?? null,
+          roomTypeCode: item.roomTypeCode,
         })),
         contactEmail: body.contactEmail,
         contactPhone: body.contactPhone,

@@ -7,6 +7,7 @@ import { BookingPanel } from '@/components/BookingPanel';
 import { AvailabilityCalendar } from '@/components/AvailabilityCalendar';
 import { ReviewSection } from '@/components/ReviewSection';
 import { SaveToWishlistButton } from '@/components/SaveToWishlistButton';
+import { SafeImage } from '@/components/SafeImage';
 import { resolveServerLocale } from '@/lib/i18n/config';
 import { createTranslator } from '@/lib/i18n/dictionaries';
 import type { LocaleCode } from '@/lib/i18n/config';
@@ -171,6 +172,31 @@ export default async function ProductPage({ params, searchParams }: PageProps) {
                 {t('product.description')}
               </h2>
               <p style={{ whiteSpace: 'pre-line' }}>{product.description}</p>
+            </section>
+          )}
+
+          {/* Live air traffic. Ambient context only — see `LiveContent.advisory`. */}
+          {product.live?.summary && (
+            <section className="card card-pad" data-live-content={product.slug}>
+              <div className="row-between wrap" style={{ gap: 'var(--sp-3)', marginBottom: 'var(--sp-3)' }}>
+                <h2 style={{ fontSize: 18 }}>{t('product.liveTraffic')}</h2>
+                <span className="badge badge-neutral tiny">{t('product.liveAdvisory')}</span>
+              </div>
+              <p className="muted" style={{ marginTop: 0 }}>
+                {product.live.summary}
+              </p>
+              <ul
+                className="row wrap tiny muted"
+                style={{ gap: 'var(--sp-3)', listStyle: 'none', margin: 'var(--sp-3) 0 0', padding: 0 }}
+              >
+                {product.live.flights.slice(0, 4).map((flight) => (
+                  <li key={flight.icao24}>
+                    <span className="bold">{flight.callsign}</span>
+                    {flight.aircraftType ? ` · ${flight.aircraftType}` : ''}
+                    {flight.altitudeFt !== null ? ` · ${Math.round(flight.altitudeFt / 100) * 100} ft` : ''}
+                  </li>
+                ))}
+              </ul>
             </section>
           )}
 
@@ -361,17 +387,23 @@ function Gallery({
   return (
     <div className="grid" style={{ gridTemplateColumns: '2fr 1fr', gap: 'var(--sp-3)' }}>
       <div style={{ position: 'relative', borderRadius: 'var(--r-lg)', overflow: 'hidden', minHeight: 380 }}>
-        <img src={hero.url} alt={hero.altText ?? name} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+        <SafeImage
+          src={hero.url}
+          alt={hero.altText ?? name}
+          loading="eager"
+          style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+          fallback={<div className="img-fallback" aria-hidden>✦</div>}
+        />
       </div>
 
       <div className="grid" style={{ gap: 'var(--sp-3)', gridTemplateRows: '1fr 1fr' }}>
         {rest.slice(0, 2).map((image) => (
           <div key={image.url} style={{ borderRadius: 'var(--r-lg)', overflow: 'hidden' }}>
-            <img
+            <SafeImage
               src={image.url}
               alt={image.altText ?? name}
               style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-              loading="lazy"
+              fallback={<div className="img-fallback" aria-hidden>✦</div>}
             />
           </div>
         ))}
